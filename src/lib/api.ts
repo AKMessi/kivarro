@@ -2,8 +2,11 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   ApiStatus,
   BenchmarkResult,
+  ChatTurn,
+  EngineStatus,
   HardwareSnapshot,
   InferenceProfile,
+  InferenceRunResult,
   LogEntry,
   ModelRecord,
   ModelLoadPlan,
@@ -65,6 +68,24 @@ const fallbackApiStatus: ApiStatus = {
       status: "Planned",
     },
   ],
+};
+
+const fallbackEngineStatus: EngineStatus = {
+  backend: "llama.cpp",
+  state: "preview",
+  message: "Open Kivarro in Tauri to supervise a local llama-server process.",
+  configured: false,
+  binaryPath: null,
+  pid: null,
+  activeModelId: null,
+  activeModelName: null,
+  host: "127.0.0.1",
+  port: 8080,
+  baseUrl: "http://127.0.0.1:8080/v1",
+  healthOk: false,
+  lastTokensPerSecond: 0,
+  contextUsedTokens: 0,
+  contextTotalTokens: 32768,
 };
 
 export const fallbackProfiles: InferenceProfile[] = [
@@ -283,6 +304,18 @@ async function safeInvoke<T>(command: string, fallback: T, args?: Record<string,
   }
 }
 
+async function invokeOrPreview<T>(
+  command: string,
+  fallback: T,
+  args?: Record<string, unknown>,
+): Promise<T> {
+  if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) {
+    return fallback;
+  }
+
+  return invoke<T>(command, args);
+}
+
 export function getHardwareSnapshot(): Promise<HardwareSnapshot> {
   return safeInvoke("get_hardware_snapshot", fallbackHardware);
 }
@@ -316,6 +349,44 @@ export function getModelLoadPlan(
 
 export function getApiStatus(): Promise<ApiStatus> {
   return safeInvoke("get_api_status", fallbackApiStatus);
+}
+
+export function getEngineStatus(): Promise<EngineStatus> {
+  return safeInvoke("get_engine_status", fallbackEngineStatus);
+}
+
+export function startLlamaServer(
+  modelId: string,
+  profile: InferenceProfile,
+): Promise<EngineStatus> {
+  return invokeOrPreview("start_llama_server", fallbackEngineStatus, { modelId, profile });
+}
+
+export function stopLlamaServer(): Promise<EngineStatus> {
+  return invokeOrPreview("stop_llama_server", fallbackEngineStatus);
+}
+
+export function runChatCompletion(
+  modelId: string,
+  profile: InferenceProfile,
+  prompt: string,
+  history: ChatTurn[],
+): Promise<InferenceRunResult> {
+  return invokeOrPreview(
+    "run_chat_completion",
+    {
+      content: "Preview mode cannot reach a local inference engine. Open Kivarro in Tauri to run this prompt.",
+      model: "preview",
+      backend: "preview",
+      elapsedMs: 0,
+      tokensPerSecond: 0,
+      promptTokens: null,
+      completionTokens: null,
+      totalTokens: null,
+      finishReason: "preview",
+    },
+    { modelId, profile, prompt, history },
+  );
 }
 
 export function listBenchmarkResults(): Promise<BenchmarkResult[]> {

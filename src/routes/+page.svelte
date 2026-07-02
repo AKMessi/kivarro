@@ -41,6 +41,7 @@
   import {
     fallbackProfiles,
     getApiStatus,
+    getEngineStatus,
     getHardwareSnapshot,
     getModelLoadPlan,
     getRuntimeMetrics,
@@ -48,13 +49,19 @@
     listInferenceProfiles,
     listModels,
     listSystemLogs,
+    runChatCompletion,
     saveInferenceProfile,
+    startLlamaServer,
+    stopLlamaServer,
   } from "$lib/api";
   import type {
     ApiStatus,
     BenchmarkResult,
+    ChatTurn,
+    EngineStatus,
     HardwareSnapshot,
     InferenceProfile,
+    InferenceRunResult,
     LogEntry,
     ModelRecord,
     ModelLoadPlan,
@@ -115,6 +122,9 @@
   let modelFilter = "";
   let logFilter = "ALL";
   let profileSaveStatus = "Synced";
+  let engineBusy = false;
+  let engineNotice = "";
+  let promptBusy = false;
 
   let hardware: HardwareSnapshot | null = null;
   let metrics: RuntimeMetrics | null = null;
@@ -122,12 +132,13 @@
   let profiles: InferenceProfile[] = fallbackProfiles;
   let loadPlan: ModelLoadPlan | null = null;
   let apiStatus: ApiStatus | null = null;
+  let engineStatus: EngineStatus | null = null;
   let benchmarks: BenchmarkResult[] = [];
   let logs: LogEntry[] = [];
 
   let sampling = controlsFromProfile(fallbackProfiles[0]);
 
-  const chatMessages: ChatMessage[] = [
+  let chatMessages: ChatMessage[] = [
     {
       id: "system",
       role: "system",
@@ -170,6 +181,15 @@
   );
   $: filteredLogs =
     logFilter === "ALL" ? logs : logs.filter((entry) => entry.level.toUpperCase() === logFilter);
+  $: engineOnline = engineStatus?.state === "ready";
+  $: engineLoading = engineStatus?.state === "loading";
+  $: engineLabel = engineBusy
+    ? "Starting"
+    : engineOnline
+      ? "Ready"
+      : engineLoading
+        ? "Loading"
+        : "Load model";
   $: document.documentElement.dataset.theme = theme;
 
   onMount(() => {
@@ -191,13 +211,23 @@
   });
 
   async function hydrate() {
-    const [nextHardware, nextMetrics, nextModels, nextProfiles, nextApiStatus, nextBenchmarks, nextLogs] =
+    const [
+      nextHardware,
+      nextMetrics,
+      nextModels,
+      nextProfiles,
+      nextApiStatus,
+      nextEngineStatus,
+      nextBenchmarks,
+      nextLogs,
+    ] =
       await Promise.all([
         getHardwareSnapshot(),
         getRuntimeMetrics(),
         listModels(),
         listInferenceProfiles(),
         getApiStatus(),
+        getEngineStatus(),
         listBenchmarkResults(),
         listSystemLogs(),
       ]);
@@ -210,13 +240,23 @@
     sampling = controlsFromProfile(profiles[0] ?? fallbackProfiles[0]);
     selectedModelId = nextModels[0]?.id ?? "";
     apiStatus = nextApiStatus;
+    engineStatus = nextEngineStatus;
+    engineNotice = nextEngineStatus.message;
     benchmarks = nextBenchmarks;
     logs = nextLogs;
     await updateLoadPlan();
   }
 
   async function refreshRuntime() {
-    metrics = await getRuntimeMetrics();
+    const [nextMetrics, nextEngineStatus, nextApiStatus] = await Promise.all([
+      getRuntimeMetrics(),
+      getEngineStatus(),
+      getApiStatus(),
+    ]);
+    metrics = nextMetrics;
+    engineStatus = nextEngineStatus;
+    apiStatus = nextApiStatus;
+    engineNotice = nextEngineStatus.message;
   }
 
   function setActiveView(view: ViewId) {
@@ -264,9 +304,90 @@
     theme = theme === "dark" ? "light" : "dark";
   }
 
-  function submitPrompt() {
-    if (!promptText.trim()) return;
+  async function startSelectedModel() {
+    if (!selectedModelId || !selectedModel) {
+      engineNotice = "Select a GGUF model before loading.";
+      return;
+    }
+
+    engineBusy = true;
+    engineNotice = `Starting llama-server for ${selectedModel.name}`;
+    try {
+      engineStatus = await startLlamaServer(selectedModelId, buildProfileFromControls());
+      engineNotice = engineStatus.message;
+      const [nextMetrics, nextApiStatus] = await Promise.all([getRuntimeMetrics(), getApiStatus()]);
+      metrics = nextMetrics;
+      apiStatus = nextApiStatus;
+    } catch (error) {
+      engineNotice = errorMessage(error);
+      addSystemMessage("Engine", engineNotice);
+    } finally {
+      engineBusy = false;
+    }
+  }
+
+  async function stopEngine() {
+    engineBusy = true;
+    try {
+      engineStatus = await stopLlamaServer();
+      engineNotice = engineStatus.message;
+      const [nextMetrics, nextApiStatus] = await Promise.all([getRuntimeMetrics(), getApiStatus()]);
+      metrics = nextMetrics;
+      apiStatus = nextApiStatus;
+    } catch (error) {
+      engineNotice = errorMessage(error);
+      addSystemMessage("Engine", engineNotice);
+    } finally {
+      engineBusy = false;
+    }
+  }
+
+  async function submitPrompt() {
+    const prompt = promptText.trim();
+    if (!prompt || promptBusy) return;
+    if (!selectedModelId) {
+      addSystemMessage("Engine", "Select and load a model before sending a prompt.");
+      return;
+    }
+
+    const history = chatMessages
+      .filter((message) => message.role === "user" || message.role === "assistant")
+      .slice(-12)
+      .map((message): ChatTurn => ({ role: message.role, content: message.content }));
+
+    chatMessages = [
+      ...chatMessages,
+      {
+        id: createId("user"),
+        role: "user",
+        label: "You",
+        content: prompt,
+      },
+    ];
     promptText = "";
+    promptBusy = true;
+
+    try {
+      const result = await runChatCompletion(
+        selectedModelId,
+        buildProfileFromControls(),
+        prompt,
+        history,
+      );
+      appendAssistantResult(result);
+      const [nextMetrics, nextEngineStatus, nextApiStatus] = await Promise.all([
+        getRuntimeMetrics(),
+        getEngineStatus(),
+        getApiStatus(),
+      ]);
+      metrics = nextMetrics;
+      engineStatus = nextEngineStatus;
+      apiStatus = nextApiStatus;
+    } catch (error) {
+      addSystemMessage("Engine", errorMessage(error));
+    } finally {
+      promptBusy = false;
+    }
   }
 
   async function minimizeWindow() {
@@ -312,6 +433,42 @@
 
   function formatLayerCount(value: number | null | undefined) {
     return value && value > 0 ? `${value}` : "estimated";
+  }
+
+  function createId(prefix: string) {
+    return `${prefix}-${globalThis.crypto?.randomUUID?.() ?? Date.now().toString(36)}`;
+  }
+
+  function errorMessage(error: unknown) {
+    if (typeof error === "string") return error;
+    if (error instanceof Error) return error.message;
+    return "Local engine command failed.";
+  }
+
+  function addSystemMessage(label: string, content: string) {
+    chatMessages = [
+      ...chatMessages,
+      {
+        id: createId("system"),
+        role: "system",
+        label,
+        content,
+      },
+    ];
+  }
+
+  function appendAssistantResult(result: InferenceRunResult) {
+    chatMessages = [
+      ...chatMessages,
+      {
+        id: createId("assistant"),
+        role: "assistant",
+        label: result.model,
+        content: result.content,
+        tokens: result.completionTokens ?? undefined,
+        speed: result.tokensPerSecond,
+      },
+    ];
   }
 
   function controlsFromProfile(profile: InferenceProfile) {
@@ -562,9 +719,9 @@
               <Split size={15} />
               Split view
             </button>
-            <button class="primary-button">
+            <button class:online={engineOnline} class="primary-button" disabled={engineBusy} onclick={startSelectedModel}>
               <Play size={15} />
-              Load model
+              {engineLabel}
             </button>
           </div>
         </section>
@@ -573,7 +730,7 @@
           <div class="chat-pane">
             <div class="pane-header">
               <span>{metrics?.activeModel ?? "No model loaded"}</span>
-              <code>{formatNumber(metrics?.tokensPerSecond ?? 0)} tok/s</code>
+              <code>{engineStatus?.state ?? "offline"} / {formatNumber(metrics?.tokensPerSecond ?? 0)} tok/s</code>
             </div>
             <div class="message-list">
               {#each chatMessages as message}
@@ -622,7 +779,7 @@
                 if ((event.metaKey || event.ctrlKey) && event.key === "Enter") submitPrompt();
               }}
             ></textarea>
-            <button class="send-button" aria-label="Send prompt" onclick={submitPrompt}>
+            <button class="send-button" aria-label="Send prompt" disabled={promptBusy} onclick={submitPrompt}>
               <Send size={18} />
             </button>
           </div>
@@ -1026,7 +1183,12 @@
             <p class="eyebrow">Local API Server</p>
             <h1>OpenAI-compatible gateway</h1>
           </div>
-          <button class:online={apiStatus?.enabled} class="power-button">
+          <button
+            class:online={apiStatus?.enabled}
+            class="power-button"
+            disabled={engineBusy}
+            onclick={() => (apiStatus?.enabled ? stopEngine() : startSelectedModel())}
+          >
             <Power size={16} />
             {apiStatus?.enabled ? "Server on" : "Server off"}
           </button>
@@ -1129,6 +1291,35 @@
           <code>{profileSaveStatus}</code>
         </div>
         <button class="inspector-action" onclick={saveCurrentProfile}>Save profile</button>
+      </section>
+
+      <section class="inspector-section">
+        <div class="section-label">Engine</div>
+        <div class="stat-row">
+          <span>Status</span>
+          <code>{engineStatus?.state ?? "offline"}</code>
+        </div>
+        <div class="stat-row">
+          <span>Runtime</span>
+          <code>{engineStatus?.backend ?? "llama.cpp"}</code>
+        </div>
+        <div class="stat-row">
+          <span>PID</span>
+          <code>{engineStatus?.pid ?? "none"}</code>
+        </div>
+        <div class="stat-row">
+          <span>Binary</span>
+          <code>{engineStatus?.binaryPath ?? "unconfigured"}</code>
+        </div>
+        <p class="engine-message">{engineNotice}</p>
+        <div class="engine-actions">
+          <button class="inspector-action" disabled={engineBusy} onclick={startSelectedModel}>
+            {engineOnline ? "Restart model" : "Load model"}
+          </button>
+          <button class="inspector-action secondary" disabled={engineBusy || !apiStatus?.enabled} onclick={stopEngine}>
+            Stop
+          </button>
+        </div>
       </section>
 
       <section class="inspector-section">
@@ -1353,6 +1544,11 @@
   .tool-button:hover {
     background: var(--panel-2);
     color: var(--text);
+  }
+
+  button:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
   }
 
   .shell {
@@ -1675,6 +1871,11 @@
     color: #0e0e11;
     border-color: var(--amber);
     background: var(--amber);
+  }
+
+  .primary-button.online {
+    border-color: var(--cyan);
+    background: var(--cyan);
   }
 
   .power-button {
@@ -2387,6 +2588,25 @@
     color: #0e0e11;
     background: var(--amber);
     cursor: pointer;
+  }
+
+  .inspector-action.secondary {
+    color: var(--text);
+    background: var(--panel-2);
+  }
+
+  .engine-message {
+    margin: 8px 0 0;
+    color: var(--dim);
+    font-size: 12px;
+    line-height: 1.45;
+  }
+
+  .engine-actions {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 76px;
+    gap: 8px;
+    margin-top: 10px;
   }
 
   .mini-bar {

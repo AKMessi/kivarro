@@ -176,6 +176,41 @@ export interface ApiStatus {
   endpoints: ApiEndpoint[];
 }
 
+export interface EngineStatus {
+  backend: string;
+  state: string;
+  message: string;
+  configured: boolean;
+  binaryPath?: string | null;
+  pid?: number | null;
+  activeModelId?: string | null;
+  activeModelName?: string | null;
+  host: string;
+  port: number;
+  baseUrl: string;
+  healthOk: boolean;
+  lastTokensPerSecond: number;
+  contextUsedTokens: number;
+  contextTotalTokens: number;
+}
+
+export interface ChatTurn {
+  role: "system" | "user" | "assistant";
+  content: string;
+}
+
+export interface InferenceRunResult {
+  content: string;
+  model: string;
+  backend: string;
+  elapsedMs: number;
+  tokensPerSecond: number;
+  promptTokens?: number | null;
+  completionTokens?: number | null;
+  totalTokens?: number | null;
+  finishReason?: string | null;
+}
+
 export interface BenchmarkResult {
   model: string;
   backend: string;

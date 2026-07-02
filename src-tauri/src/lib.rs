@@ -1,14 +1,21 @@
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
 use std::{
     collections::HashMap,
     env, fs,
     fs::File,
     io::{Read, Seek, SeekFrom},
+    net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
+    process::{Child, Command as ProcessCommand, Stdio},
+    sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 use sysinfo::System;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Manager, State};
+
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 
 const PROFILE_EXTENSION: &str = "kivarro.json";
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";
@@ -19,6 +26,16 @@ const MAX_GGUF_KEY_BYTES: u64 = 65_535;
 const MAX_GGUF_STRING_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_GGUF_ARRAY_ITEMS: u64 = 2_000_000;
 const MAX_GGUF_ARRAY_DEPTH: u8 = 4;
+const DEFAULT_API_HOST: &str = "127.0.0.1";
+const DEFAULT_API_PORT: u16 = 8080;
+const LLAMA_SERVER_ENV: &str = "KIVARRO_LLAMA_SERVER";
+const API_PORT_ENV: &str = "KIVARRO_API_PORT";
+const MAX_HTTP_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+const HTTP_HEALTH_TIMEOUT_MS: u64 = 400;
+const HTTP_CHAT_TIMEOUT_MS: u64 = 3_600_000;
+
+#[cfg(target_os = "windows")]
+const WINDOWS_CREATE_NO_WINDOW: u32 = 0x08000000;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -254,6 +271,93 @@ struct LogEntry {
     timestamp: String,
 }
 
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct EngineStatus {
+    backend: String,
+    state: String,
+    message: String,
+    configured: bool,
+    binary_path: Option<String>,
+    pid: Option<u32>,
+    active_model_id: Option<String>,
+    active_model_name: Option<String>,
+    host: String,
+    port: u16,
+    base_url: String,
+    health_ok: bool,
+    last_tokens_per_second: f32,
+    context_used_tokens: u32,
+    context_total_tokens: u32,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InferenceRunResult {
+    content: String,
+    model: String,
+    backend: String,
+    elapsed_ms: u128,
+    tokens_per_second: f32,
+    prompt_tokens: Option<u32>,
+    completion_tokens: Option<u32>,
+    total_tokens: Option<u32>,
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChatTurn {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug)]
+struct HttpResponse {
+    status_code: u16,
+    body: Vec<u8>,
+}
+
+struct EngineRuntime {
+    inner: Mutex<ManagedEngine>,
+}
+
+struct ManagedEngine {
+    child: Option<Child>,
+    active_model_id: Option<String>,
+    active_model_name: Option<String>,
+    host: String,
+    port: u16,
+    last_error: Option<String>,
+    last_tokens_per_second: f32,
+    context_used_tokens: u32,
+    context_total_tokens: u32,
+}
+
+impl Default for EngineRuntime {
+    fn default() -> Self {
+        Self {
+            inner: Mutex::new(ManagedEngine::default()),
+        }
+    }
+}
+
+impl Default for ManagedEngine {
+    fn default() -> Self {
+        Self {
+            child: None,
+            active_model_id: None,
+            active_model_name: None,
+            host: DEFAULT_API_HOST.to_string(),
+            port: configured_api_port(),
+            last_error: None,
+            last_tokens_per_second: 0.0,
+            context_used_tokens: 0,
+            context_total_tokens: 32768,
+        }
+    }
+}
+
 #[tauri::command]
 fn get_hardware_snapshot() -> Result<HardwareSnapshot, String> {
     let mut system = System::new_all();
@@ -326,18 +430,22 @@ fn get_hardware_snapshot() -> Result<HardwareSnapshot, String> {
 }
 
 #[tauri::command]
-fn get_runtime_metrics() -> Result<RuntimeMetrics, String> {
+fn get_runtime_metrics(engine: State<'_, EngineRuntime>) -> Result<RuntimeMetrics, String> {
     let snapshot = get_hardware_snapshot()?;
+    let status = current_engine_status(&engine)?;
 
     Ok(RuntimeMetrics {
-        active_model: "No model loaded".to_string(),
-        active_backend: "Engine idle".to_string(),
-        server_url: "http://127.0.0.1:8080/v1".to_string(),
-        api_port: 8080,
-        api_online: false,
-        tokens_per_second: 0.0,
-        context_used_tokens: 0,
-        context_total_tokens: 32768,
+        active_model: status
+            .active_model_name
+            .clone()
+            .unwrap_or_else(|| "No model loaded".to_string()),
+        active_backend: format!("{} / {}", status.backend, status.state),
+        server_url: status.base_url,
+        api_port: status.port,
+        api_online: status.health_ok,
+        tokens_per_second: status.last_tokens_per_second,
+        context_used_tokens: status.context_used_tokens,
+        context_total_tokens: status.context_total_tokens,
         cpu_utilization_percent: snapshot.cpu_utilization_percent,
         gpu_utilization_percent: 0.0,
         ram_used_gib: snapshot.ram_used_gib,
@@ -580,17 +688,234 @@ fn get_model_load_plan(
 }
 
 #[tauri::command]
-fn get_api_status() -> Result<ApiStatus, String> {
+fn get_engine_status(engine: State<'_, EngineRuntime>) -> Result<EngineStatus, String> {
+    current_engine_status(&engine)
+}
+
+#[tauri::command]
+fn start_llama_server(
+    engine: State<'_, EngineRuntime>,
+    model_id: String,
+    profile: InferenceProfile,
+) -> Result<EngineStatus, String> {
+    validate_profile(&profile)?;
+
+    let model_path = canonical_model_path(&model_id)?;
+    if !is_gguf_file(&model_path) {
+        return Err("llama-server requires a GGUF model for this adapter slice".to_string());
+    }
+    let canonical_model_id = model_path.to_string_lossy().to_string();
+
+    let binary_path = find_llama_server_binary()
+        .ok_or_else(|| format!("llama-server not found. Set {LLAMA_SERVER_ENV} to the binary path or add llama-server to PATH."))?;
+    let model_name = model_display_name_from_path(&model_path);
+    let port = configured_api_port();
+    let host = DEFAULT_API_HOST.to_string();
+    let args = build_llama_server_args(&model_path, &profile, &host, port);
+
+    let mut guard = engine
+        .inner
+        .lock()
+        .map_err(|_| "engine state lock is poisoned".to_string())?;
+
+    refresh_engine_process(&mut guard);
+    if guard.child.is_some()
+        && guard.active_model_id.as_deref() == Some(canonical_model_id.as_str())
+    {
+        guard.last_error = None;
+        return Ok(engine_status_from_guard(&mut guard, Some(binary_path)));
+    }
+
+    stop_child(&mut guard)?;
+
+    let mut command = ProcessCommand::new(&binary_path);
+    command
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(target_os = "windows")]
+    command.creation_flags(WINDOWS_CREATE_NO_WINDOW);
+
+    let child = command.spawn().map_err(|err| {
+        format!(
+            "failed to start llama-server at {}: {err}",
+            binary_path.display()
+        )
+    })?;
+
+    guard.child = Some(child);
+    guard.active_model_id = Some(canonical_model_id);
+    guard.active_model_name = Some(model_name);
+    guard.host = host;
+    guard.port = port;
+    guard.last_error = None;
+    guard.last_tokens_per_second = 0.0;
+    guard.context_used_tokens = 0;
+    guard.context_total_tokens = profile.runtime.context_length;
+
+    Ok(engine_status_from_guard(&mut guard, Some(binary_path)))
+}
+
+#[tauri::command]
+fn stop_llama_server(engine: State<'_, EngineRuntime>) -> Result<EngineStatus, String> {
+    let mut guard = engine
+        .inner
+        .lock()
+        .map_err(|_| "engine state lock is poisoned".to_string())?;
+
+    stop_child(&mut guard)?;
+    guard.active_model_id = None;
+    guard.active_model_name = None;
+    guard.last_error = None;
+    guard.last_tokens_per_second = 0.0;
+    guard.context_used_tokens = 0;
+
+    Ok(engine_status_from_guard(
+        &mut guard,
+        find_llama_server_binary(),
+    ))
+}
+
+#[tauri::command]
+fn run_chat_completion(
+    engine: State<'_, EngineRuntime>,
+    model_id: String,
+    profile: InferenceProfile,
+    prompt: String,
+    history: Vec<ChatTurn>,
+) -> Result<InferenceRunResult, String> {
+    validate_profile(&profile)?;
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return Err("prompt is required".to_string());
+    }
+    let requested_model_id = canonical_model_path(&model_id)?
+        .to_string_lossy()
+        .to_string();
+
+    let (host, port, active_model_id, active_model_name) = {
+        let mut guard = engine
+            .inner
+            .lock()
+            .map_err(|_| "engine state lock is poisoned".to_string())?;
+        refresh_engine_process(&mut guard);
+
+        let active_model_id = guard
+            .active_model_id
+            .clone()
+            .ok_or_else(|| "no llama-server model is loaded".to_string())?;
+        if active_model_id != requested_model_id {
+            return Err("selected model is not the active llama-server model".to_string());
+        }
+        if guard.child.is_none() {
+            return Err("llama-server is not running".to_string());
+        }
+
+        (
+            guard.host.clone(),
+            guard.port,
+            active_model_id,
+            guard
+                .active_model_name
+                .clone()
+                .unwrap_or_else(|| "local-model".to_string()),
+        )
+    };
+
+    match probe_llama_health(&host, port, HTTP_HEALTH_TIMEOUT_MS) {
+        HealthProbe::Ready => {}
+        HealthProbe::Loading(message) => {
+            return Err(format!("llama-server is still loading: {message}"));
+        }
+        HealthProbe::Offline(message) => {
+            return Err(format!("llama-server is not reachable: {message}"));
+        }
+    }
+
+    let started = SystemTime::now();
+    let payload = build_chat_completion_payload(&profile, &active_model_name, prompt, &history)?;
+    let response = http_json_request(
+        &host,
+        port,
+        "POST",
+        "/v1/chat/completions",
+        Some(&payload),
+        HTTP_CHAT_TIMEOUT_MS,
+    )?;
+    let elapsed_ms = started
+        .elapsed()
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or_default();
+    let body = parse_llama_json_response(response)?;
+    let content = body
+        .pointer("/choices/0/message/content")
+        .and_then(Value::as_str)
+        .or_else(|| body.pointer("/choices/0/text").and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_string();
+
+    if content.is_empty() {
+        return Err("llama-server returned an empty completion".to_string());
+    }
+
+    let prompt_tokens = json_u32(&body, "/usage/prompt_tokens");
+    let completion_tokens = json_u32(&body, "/usage/completion_tokens");
+    let total_tokens = json_u32(&body, "/usage/total_tokens");
+    let finish_reason = body
+        .pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let tokens_per_second = completion_tokens
+        .filter(|_| elapsed_ms > 0)
+        .map(|tokens| (tokens as f64 / elapsed_ms as f64 * 1000.0) as f32)
+        .unwrap_or(0.0);
+
+    {
+        let mut guard = engine
+            .inner
+            .lock()
+            .map_err(|_| "engine state lock is poisoned".to_string())?;
+        guard.last_tokens_per_second = tokens_per_second;
+        guard.context_used_tokens = total_tokens.unwrap_or_else(|| {
+            (prompt_tokens.unwrap_or_default() + completion_tokens.unwrap_or_default())
+                .min(profile.runtime.context_length)
+        });
+        guard.context_total_tokens = profile.runtime.context_length;
+        guard.active_model_id = Some(active_model_id);
+        guard.active_model_name = Some(active_model_name.clone());
+        guard.last_error = None;
+    }
+
+    Ok(InferenceRunResult {
+        content,
+        model: active_model_name,
+        backend: "llama.cpp".to_string(),
+        elapsed_ms,
+        tokens_per_second,
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+        finish_reason,
+    })
+}
+
+#[tauri::command]
+fn get_api_status(engine: State<'_, EngineRuntime>) -> Result<ApiStatus, String> {
+    let status = current_engine_status(&engine)?;
+
     Ok(ApiStatus {
-        enabled: false,
-        port: 8080,
-        base_url: "http://127.0.0.1:8080/v1".to_string(),
+        enabled: matches!(status.state.as_str(), "ready" | "loading"),
+        port: status.port,
+        base_url: status.base_url,
         endpoints: vec![
             ApiEndpoint {
                 method: "POST".to_string(),
                 path: "/v1/chat/completions".to_string(),
-                description: "OpenAI-compatible streaming chat completions".to_string(),
-                status: "Planned".to_string(),
+                description: "OpenAI-compatible local chat completions through llama-server"
+                    .to_string(),
+                status: if status.health_ok { "Ready" } else { "Offline" }.to_string(),
             },
             ApiEndpoint {
                 method: "POST".to_string(),
@@ -602,7 +927,13 @@ fn get_api_status() -> Result<ApiStatus, String> {
                 method: "GET".to_string(),
                 path: "/v1/models".to_string(),
                 description: "Loaded and discoverable local models".to_string(),
-                status: "Planned".to_string(),
+                status: if status.health_ok { "Ready" } else { "Offline" }.to_string(),
+            },
+            ApiEndpoint {
+                method: "GET".to_string(),
+                path: "/health".to_string(),
+                description: "llama-server readiness probe".to_string(),
+                status: status.state,
             },
         ],
     })
@@ -970,6 +1301,559 @@ fn unix_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default()
+}
+
+fn configured_api_port() -> u16 {
+    env::var(API_PORT_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok())
+        .filter(|port| *port > 0)
+        .unwrap_or(DEFAULT_API_PORT)
+}
+
+fn current_engine_status(engine: &State<'_, EngineRuntime>) -> Result<EngineStatus, String> {
+    let binary_path = find_llama_server_binary();
+    let mut guard = engine
+        .inner
+        .lock()
+        .map_err(|_| "engine state lock is poisoned".to_string())?;
+
+    Ok(engine_status_from_guard(&mut guard, binary_path))
+}
+
+fn engine_status_from_guard(
+    guard: &mut ManagedEngine,
+    binary_path: Option<PathBuf>,
+) -> EngineStatus {
+    refresh_engine_process(guard);
+
+    let pid = guard.child.as_ref().map(Child::id);
+    let (state, message, health_ok) = if guard.child.is_some() {
+        match probe_llama_health(&guard.host, guard.port, HTTP_HEALTH_TIMEOUT_MS) {
+            HealthProbe::Ready => (
+                "ready".to_string(),
+                "llama-server is ready for local chat completions".to_string(),
+                true,
+            ),
+            HealthProbe::Loading(message) => ("loading".to_string(), message, false),
+            HealthProbe::Offline(message) => ("loading".to_string(), message, false),
+        }
+    } else if let Some(error) = guard.last_error.as_ref() {
+        ("error".to_string(), error.clone(), false)
+    } else if binary_path.is_some() {
+        (
+            "offline".to_string(),
+            "llama-server is configured but no model is loaded".to_string(),
+            false,
+        )
+    } else {
+        (
+            "unconfigured".to_string(),
+            format!("Set {LLAMA_SERVER_ENV} or add llama-server to PATH"),
+            false,
+        )
+    };
+
+    EngineStatus {
+        backend: "llama.cpp".to_string(),
+        state,
+        message,
+        configured: binary_path.is_some(),
+        binary_path: binary_path.map(|path| path.to_string_lossy().to_string()),
+        pid,
+        active_model_id: guard.active_model_id.clone(),
+        active_model_name: guard.active_model_name.clone(),
+        host: guard.host.clone(),
+        port: guard.port,
+        base_url: format!("http://{}:{}/v1", guard.host, guard.port),
+        health_ok,
+        last_tokens_per_second: guard.last_tokens_per_second,
+        context_used_tokens: guard.context_used_tokens,
+        context_total_tokens: guard.context_total_tokens,
+    }
+}
+
+fn refresh_engine_process(guard: &mut ManagedEngine) {
+    let Some(child) = guard.child.as_mut() else {
+        return;
+    };
+
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            guard.child = None;
+            guard.last_error = Some(format!("llama-server exited with status {status}"));
+        }
+        Ok(None) => {}
+        Err(err) => {
+            guard.child = None;
+            guard.last_error = Some(format!("failed to inspect llama-server process: {err}"));
+        }
+    }
+}
+
+fn stop_child(guard: &mut ManagedEngine) -> Result<(), String> {
+    let Some(mut child) = guard.child.take() else {
+        return Ok(());
+    };
+
+    match child.try_wait() {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => {
+            child
+                .kill()
+                .map_err(|err| format!("failed to stop llama-server: {err}"))?;
+            child
+                .wait()
+                .map(|_| ())
+                .map_err(|err| format!("failed to wait for llama-server shutdown: {err}"))
+        }
+        Err(err) => Err(format!("failed to inspect llama-server before stop: {err}")),
+    }
+}
+
+fn canonical_model_path(model_id: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(model_id);
+    if !path.exists() {
+        return Err(format!("model does not exist: {}", path.display()));
+    }
+    if !is_supported_model_file(&path) {
+        return Err(format!(
+            "unsupported model file extension: {}",
+            path.display()
+        ));
+    }
+
+    path.canonicalize()
+        .map_err(|err| format!("failed to resolve model path {}: {err}", path.display()))
+}
+
+fn model_display_name_from_path(path: &Path) -> String {
+    read_model_gguf_metadata(path)
+        .as_ref()
+        .map(|summary| {
+            let fallback = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("local-model");
+            gguf_display_name(summary, fallback)
+        })
+        .unwrap_or_else(|| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("local-model")
+                .to_string()
+        })
+}
+
+fn find_llama_server_binary() -> Option<PathBuf> {
+    if let Ok(value) = env::var(LLAMA_SERVER_ENV) {
+        let trimmed = value.trim().trim_matches('"');
+        if !trimmed.is_empty() {
+            let configured = PathBuf::from(trimmed);
+            if configured.is_file() {
+                return Some(configured);
+            }
+            if let Some(found) = find_executable_on_path(trimmed) {
+                return Some(found);
+            }
+        }
+    }
+
+    ["llama-server", "llama-server.exe", "server", "server.exe"]
+        .iter()
+        .find_map(|candidate| find_executable_on_path(candidate))
+}
+
+fn find_executable_on_path(candidate: &str) -> Option<PathBuf> {
+    let candidate_path = PathBuf::from(candidate);
+    if candidate_path.components().count() > 1 && candidate_path.is_file() {
+        return Some(candidate_path);
+    }
+
+    let path_var = env::var_os("PATH")?;
+    let candidate_names = executable_candidate_names(candidate);
+    for directory in env::split_paths(&path_var) {
+        for name in &candidate_names {
+            let path = directory.join(name);
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+    }
+
+    None
+}
+
+fn executable_candidate_names(candidate: &str) -> Vec<String> {
+    #[cfg(target_os = "windows")]
+    {
+        let lower = candidate.to_ascii_lowercase();
+        if lower.ends_with(".exe") {
+            vec![candidate.to_string()]
+        } else {
+            vec![candidate.to_string(), format!("{candidate}.exe")]
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        vec![candidate.to_string()]
+    }
+}
+
+fn build_llama_server_args(
+    model_path: &Path,
+    profile: &InferenceProfile,
+    host: &str,
+    port: u16,
+) -> Vec<String> {
+    let mut args = vec![
+        "--model".to_string(),
+        model_path.to_string_lossy().to_string(),
+        "--host".to_string(),
+        host.to_string(),
+        "--port".to_string(),
+        port.to_string(),
+        "--ctx-size".to_string(),
+        profile.runtime.context_length.to_string(),
+        "--threads".to_string(),
+        profile.runtime.cpu_threads.to_string(),
+        "--batch-size".to_string(),
+        profile.runtime.batch_size.to_string(),
+        "--ubatch-size".to_string(),
+        profile.runtime.micro_batch_size.to_string(),
+        "--gpu-layers".to_string(),
+        profile.runtime.gpu_layers.to_string(),
+        "--cache-type-k".to_string(),
+        profile.runtime.kv_cache_quantization.clone(),
+        "--cache-type-v".to_string(),
+        profile.runtime.kv_cache_quantization.clone(),
+        "--flash-attn".to_string(),
+        if profile.runtime.flash_attention {
+            "on".to_string()
+        } else {
+            "off".to_string()
+        },
+    ];
+
+    if profile.runtime.use_mmap {
+        args.push("--mmap".to_string());
+    } else {
+        args.push("--no-mmap".to_string());
+    }
+
+    if profile.runtime.use_mlock {
+        args.push("--mlock".to_string());
+    }
+
+    if let Some(main_gpu) = profile.runtime.main_gpu {
+        args.push("--main-gpu".to_string());
+        args.push(main_gpu.to_string());
+    }
+
+    if !profile.runtime.tensor_split.is_empty() {
+        args.push("--tensor-split".to_string());
+        args.push(
+            profile
+                .runtime
+                .tensor_split
+                .iter()
+                .map(|value| format_float_arg(*value))
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
+
+    if let Some(base) = profile.runtime.rope_frequency_base {
+        args.push("--rope-freq-base".to_string());
+        args.push(format_float_arg(base));
+    }
+
+    if let Some(scale) = profile.runtime.rope_frequency_scale {
+        args.push("--rope-freq-scale".to_string());
+        args.push(format_float_arg(scale));
+    }
+
+    args
+}
+
+fn format_float_arg(value: f32) -> String {
+    let formatted = format!("{value:.6}");
+    formatted
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string()
+}
+
+enum HealthProbe {
+    Ready,
+    Loading(String),
+    Offline(String),
+}
+
+fn probe_llama_health(host: &str, port: u16, timeout_ms: u64) -> HealthProbe {
+    match http_json_request(host, port, "GET", "/health", None, timeout_ms) {
+        Ok(response) if response.status_code == 200 => HealthProbe::Ready,
+        Ok(response) if response.status_code == 503 => {
+            let message = serde_json::from_slice::<Value>(&response.body)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .pointer("/error/message")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .unwrap_or_else(|| "model is loading".to_string());
+            HealthProbe::Loading(message)
+        }
+        Ok(response) => HealthProbe::Offline(format!(
+            "health check returned HTTP {}",
+            response.status_code
+        )),
+        Err(err) => HealthProbe::Offline(err),
+    }
+}
+
+fn build_chat_completion_payload(
+    profile: &InferenceProfile,
+    model_name: &str,
+    prompt: &str,
+    history: &[ChatTurn],
+) -> Result<Value, String> {
+    let mut messages = Vec::new();
+    if !profile.system_prompt.trim().is_empty() {
+        messages.push(json!({
+            "role": "system",
+            "content": profile.system_prompt.trim()
+        }));
+    }
+
+    for turn in history.iter().take(32) {
+        let role = turn.role.trim();
+        let content = turn.content.trim();
+        if content.is_empty() || !matches!(role, "system" | "user" | "assistant") {
+            continue;
+        }
+        messages.push(json!({ "role": role, "content": content }));
+    }
+
+    messages.push(json!({ "role": "user", "content": prompt }));
+
+    let mut payload = Map::new();
+    payload.insert("model".to_string(), json!(model_name));
+    payload.insert("messages".to_string(), Value::Array(messages));
+    payload.insert(
+        "temperature".to_string(),
+        json!(profile.sampling.temperature),
+    );
+    payload.insert("top_p".to_string(), json!(profile.sampling.top_p));
+    payload.insert("top_k".to_string(), json!(profile.sampling.top_k));
+    payload.insert("min_p".to_string(), json!(profile.sampling.min_p));
+    payload.insert(
+        "repeat_penalty".to_string(),
+        json!(profile.sampling.repeat_penalty),
+    );
+    payload.insert(
+        "presence_penalty".to_string(),
+        json!(profile.sampling.presence_penalty),
+    );
+    payload.insert(
+        "frequency_penalty".to_string(),
+        json!(profile.sampling.frequency_penalty),
+    );
+    payload.insert("max_tokens".to_string(), json!(profile.sampling.max_tokens));
+    payload.insert("stream".to_string(), json!(false));
+
+    if let Some(seed) = profile.sampling.seed {
+        payload.insert("seed".to_string(), json!(seed));
+    }
+
+    if !profile.sampling.stop_sequences.is_empty() {
+        payload.insert("stop".to_string(), json!(profile.sampling.stop_sequences));
+    }
+
+    if profile.output.logprobs {
+        payload.insert("logprobs".to_string(), json!(true));
+        payload.insert(
+            "top_logprobs".to_string(),
+            json!(profile.output.top_logprobs),
+        );
+    }
+
+    match profile.output.mode.as_str() {
+        "json_schema" if !profile.output.json_schema.trim().is_empty() => {
+            let schema = serde_json::from_str::<Value>(&profile.output.json_schema)
+                .map_err(|err| format!("profile JSON schema is invalid: {err}"))?;
+            payload.insert(
+                "response_format".to_string(),
+                json!({
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "kivarro_profile_schema",
+                        "strict": true,
+                        "schema": schema
+                    }
+                }),
+            );
+        }
+        "json" => {
+            payload.insert(
+                "response_format".to_string(),
+                json!({ "type": "json_object" }),
+            );
+        }
+        _ => {}
+    }
+
+    if !profile.output.grammar.trim().is_empty() {
+        payload.insert("grammar".to_string(), json!(profile.output.grammar.trim()));
+    }
+
+    Ok(Value::Object(payload))
+}
+
+fn http_json_request(
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&Value>,
+    timeout_ms: u64,
+) -> Result<HttpResponse, String> {
+    let body_bytes = body
+        .map(serde_json::to_vec)
+        .transpose()
+        .map_err(|err| format!("failed to encode request JSON: {err}"))?
+        .unwrap_or_default();
+    let address = format!("{host}:{port}")
+        .parse::<SocketAddr>()
+        .map_err(|err| format!("invalid llama-server address {host}:{port}: {err}"))?;
+    let timeout = std::time::Duration::from_millis(timeout_ms);
+    let mut stream = TcpStream::connect_timeout(&address, timeout)
+        .map_err(|err| format!("failed to connect to llama-server at {host}:{port}: {err}"))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|err| format!("failed to set read timeout: {err}"))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|err| format!("failed to set write timeout: {err}"))?;
+
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: Kivarro/0.1\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body_bytes.len()
+    );
+    std::io::Write::write_all(&mut stream, request.as_bytes())
+        .map_err(|err| format!("failed to write HTTP request: {err}"))?;
+    if !body_bytes.is_empty() {
+        std::io::Write::write_all(&mut stream, &body_bytes)
+            .map_err(|err| format!("failed to write HTTP request body: {err}"))?;
+    }
+
+    let mut raw = Vec::new();
+    stream
+        .by_ref()
+        .take(MAX_HTTP_RESPONSE_BYTES + 1)
+        .read_to_end(&mut raw)
+        .map_err(|err| format!("failed to read HTTP response: {err}"))?;
+    if raw.len() as u64 > MAX_HTTP_RESPONSE_BYTES {
+        return Err(format!(
+            "llama-server response exceeds {} bytes",
+            MAX_HTTP_RESPONSE_BYTES
+        ));
+    }
+
+    parse_http_response(&raw)
+}
+
+fn parse_http_response(raw: &[u8]) -> Result<HttpResponse, String> {
+    let header_end = raw
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .ok_or_else(|| "HTTP response did not contain a header terminator".to_string())?;
+    let header_text = String::from_utf8_lossy(&raw[..header_end]);
+    let mut lines = header_text.lines();
+    let status_line = lines
+        .next()
+        .ok_or_else(|| "HTTP response did not contain a status line".to_string())?;
+    let status_code = status_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| format!("invalid HTTP status line: {status_line}"))?
+        .parse::<u16>()
+        .map_err(|err| format!("invalid HTTP status code: {err}"))?;
+    let mut headers = HashMap::new();
+    for line in lines {
+        if let Some((key, value)) = line.split_once(':') {
+            headers.insert(
+                key.trim().to_ascii_lowercase(),
+                value.trim().to_ascii_lowercase(),
+            );
+        }
+    }
+
+    let mut body = raw[header_end + 4..].to_vec();
+    if headers
+        .get("transfer-encoding")
+        .map(|value| value.contains("chunked"))
+        .unwrap_or(false)
+    {
+        body = decode_chunked_body(&body)?;
+    }
+
+    Ok(HttpResponse { status_code, body })
+}
+
+fn decode_chunked_body(raw: &[u8]) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    let mut cursor = 0;
+    loop {
+        let Some(line_end) = raw[cursor..]
+            .windows(2)
+            .position(|window| window == b"\r\n")
+            .map(|position| cursor + position)
+        else {
+            return Err("chunked response ended before chunk size".to_string());
+        };
+        let size_line = String::from_utf8_lossy(&raw[cursor..line_end]);
+        let size_hex = size_line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_hex, 16)
+            .map_err(|err| format!("invalid chunk size {size_hex}: {err}"))?;
+        cursor = line_end + 2;
+
+        if size == 0 {
+            return Ok(body);
+        }
+        if cursor + size + 2 > raw.len() {
+            return Err("chunked response ended inside chunk data".to_string());
+        }
+
+        body.extend_from_slice(&raw[cursor..cursor + size]);
+        cursor += size + 2;
+    }
+}
+
+fn parse_llama_json_response(response: HttpResponse) -> Result<Value, String> {
+    let body = serde_json::from_slice::<Value>(&response.body)
+        .map_err(|err| format!("llama-server returned invalid JSON: {err}"))?;
+    if response.status_code >= 400 {
+        let message = body
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .unwrap_or("llama-server request failed");
+        return Err(format!(
+            "llama-server HTTP {}: {message}",
+            response.status_code
+        ));
+    }
+
+    Ok(body)
+}
+
+fn json_u32(value: &Value, pointer: &str) -> Option<u32> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
 }
 
 fn read_model_gguf_metadata(path: &Path) -> Option<GgufMetadataSummary> {
@@ -1570,6 +2454,52 @@ mod tests {
         fs::remove_file(path).expect("remove synthetic GGUF");
     }
 
+    #[test]
+    fn builds_llama_server_args_from_profile_runtime() {
+        let mut profile = default_profiles()
+            .into_iter()
+            .next()
+            .expect("default profile");
+        profile.runtime.context_length = 65_536;
+        profile.runtime.cpu_threads = 12;
+        profile.runtime.batch_size = 1024;
+        profile.runtime.micro_batch_size = 256;
+        profile.runtime.gpu_layers = 41;
+        profile.runtime.kv_cache_quantization = "q8_0".to_string();
+        profile.runtime.use_mmap = false;
+        profile.runtime.use_mlock = true;
+        profile.runtime.flash_attention = false;
+        profile.runtime.main_gpu = Some(1);
+        profile.runtime.tensor_split = vec![3.0, 1.0];
+        profile.runtime.rope_frequency_base = Some(1_000_000.0);
+        profile.runtime.rope_frequency_scale = Some(0.5);
+
+        let args = build_llama_server_args(
+            Path::new("D:/models/test.gguf"),
+            &profile,
+            DEFAULT_API_HOST,
+            9090,
+        );
+
+        assert_arg_pair(&args, "--model", "D:/models/test.gguf");
+        assert_arg_pair(&args, "--host", DEFAULT_API_HOST);
+        assert_arg_pair(&args, "--port", "9090");
+        assert_arg_pair(&args, "--ctx-size", "65536");
+        assert_arg_pair(&args, "--threads", "12");
+        assert_arg_pair(&args, "--batch-size", "1024");
+        assert_arg_pair(&args, "--ubatch-size", "256");
+        assert_arg_pair(&args, "--gpu-layers", "41");
+        assert_arg_pair(&args, "--cache-type-k", "q8_0");
+        assert_arg_pair(&args, "--cache-type-v", "q8_0");
+        assert_arg_pair(&args, "--flash-attn", "off");
+        assert_arg_pair(&args, "--main-gpu", "1");
+        assert_arg_pair(&args, "--tensor-split", "3,1");
+        assert_arg_pair(&args, "--rope-freq-base", "1000000");
+        assert_arg_pair(&args, "--rope-freq-scale", "0.5");
+        assert!(args.iter().any(|arg| arg == "--no-mmap"));
+        assert!(args.iter().any(|arg| arg == "--mlock"));
+    }
+
     fn push_gguf_string_kv(bytes: &mut Vec<u8>, key: &str, value: &str) {
         push_gguf_string(bytes, key);
         bytes.extend_from_slice(&GGUF_VALUE_TYPE_STRING.to_le_bytes());
@@ -1592,11 +2522,20 @@ mod tests {
         bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
         bytes.extend_from_slice(value.as_bytes());
     }
+
+    fn assert_arg_pair(args: &[String], key: &str, value: &str) {
+        let position = args
+            .iter()
+            .position(|arg| arg == key)
+            .unwrap_or_else(|| panic!("{key} missing from args: {args:?}"));
+        assert_eq!(args.get(position + 1).map(String::as_str), Some(value));
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(EngineRuntime::default())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             get_hardware_snapshot,
@@ -1606,6 +2545,10 @@ pub fn run() {
             save_inference_profile,
             delete_inference_profile,
             get_model_load_plan,
+            get_engine_status,
+            start_llama_server,
+            stop_llama_server,
+            run_chat_completion,
             get_api_status,
             list_benchmark_results,
             list_system_logs
