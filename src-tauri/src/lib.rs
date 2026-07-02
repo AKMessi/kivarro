@@ -439,6 +439,44 @@ fn get_hardware_snapshot() -> Result<HardwareSnapshot, String> {
         },
     ];
 
+    let mut blocks = vec![
+        ComputeBlock {
+            id: "cpu".to_string(),
+            name: cpu_brand.clone(),
+            kind: "CPU".to_string(),
+            status: "Ready".to_string(),
+            utilization_percent: cpu_utilization_percent,
+            memory_total_gib: None,
+            memory_used_gib: None,
+            segments: Vec::new(),
+        },
+        ComputeBlock {
+            id: "ram".to_string(),
+            name: "System Memory".to_string(),
+            kind: "RAM".to_string(),
+            status: "Telemetry active".to_string(),
+            utilization_percent: percent(ram_used_gib, ram_total_gib),
+            memory_total_gib: Some(ram_total_gib),
+            memory_used_gib: Some(ram_used_gib),
+            segments: ram_segments,
+        },
+    ];
+    let gpu_blocks = detect_gpu_blocks();
+    if gpu_blocks.is_empty() {
+        blocks.push(ComputeBlock {
+            id: "gpu-probe".to_string(),
+            name: "Accelerator Probe".to_string(),
+            kind: "GPU".to_string(),
+            status: "No GPU telemetry source detected".to_string(),
+            utilization_percent: 0.0,
+            memory_total_gib: None,
+            memory_used_gib: None,
+            segments: Vec::new(),
+        });
+    } else {
+        blocks.extend(gpu_blocks);
+    }
+
     Ok(HardwareSnapshot {
         os: env::consts::OS.to_string(),
         architecture: env::consts::ARCH.to_string(),
@@ -447,45 +485,343 @@ fn get_hardware_snapshot() -> Result<HardwareSnapshot, String> {
         cpu_utilization_percent,
         ram_total_gib,
         ram_used_gib,
-        blocks: vec![
-            ComputeBlock {
-                id: "cpu".to_string(),
-                name: cpu_brand,
-                kind: "CPU".to_string(),
-                status: "Ready".to_string(),
-                utilization_percent: cpu_utilization_percent,
-                memory_total_gib: None,
+        blocks,
+    })
+}
+
+fn detect_gpu_blocks() -> Vec<ComputeBlock> {
+    let nvidia_blocks = detect_nvidia_smi_gpus();
+    if !nvidia_blocks.is_empty() {
+        return nvidia_blocks;
+    }
+
+    detect_platform_gpu_blocks()
+}
+
+fn detect_nvidia_smi_gpus() -> Vec<ComputeBlock> {
+    let Some(binary) = find_executable_on_path("nvidia-smi") else {
+        return Vec::new();
+    };
+    let Some(output) = command_output_text(
+        &binary,
+        &[
+            "--query-gpu=name,utilization.gpu,memory.total,memory.used",
+            "--format=csv,noheader,nounits",
+        ],
+    ) else {
+        return Vec::new();
+    };
+
+    parse_nvidia_smi_gpus(&output)
+}
+
+fn parse_nvidia_smi_gpus(output: &str) -> Vec<ComputeBlock> {
+    output
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let parts = line.split(',').map(str::trim).collect::<Vec<_>>();
+            if parts.len() < 4 || parts[0].is_empty() {
+                return None;
+            }
+
+            let utilization_percent = parts[1].trim_end_matches('%').trim().parse().unwrap_or(0.0);
+            let memory_total_gib = mib_to_gib(parts[2].parse::<f64>().unwrap_or(0.0));
+            let memory_used_gib = mib_to_gib(parts[3].parse::<f64>().unwrap_or(0.0));
+
+            Some(ComputeBlock {
+                id: format!("gpu-nvidia-{index}"),
+                name: parts[0].to_string(),
+                kind: "GPU".to_string(),
+                status: "NVIDIA telemetry active".to_string(),
+                utilization_percent,
+                memory_total_gib: Some(memory_total_gib),
+                memory_used_gib: Some(memory_used_gib),
+                segments: gpu_memory_segments(memory_total_gib, memory_used_gib),
+            })
+        })
+        .collect()
+}
+
+fn gpu_memory_segments(memory_total_gib: f64, memory_used_gib: f64) -> Vec<MemorySegment> {
+    vec![
+        MemorySegment {
+            label: "Used VRAM".to_string(),
+            gib: memory_used_gib,
+            color: "red".to_string(),
+        },
+        MemorySegment {
+            label: "Free VRAM".to_string(),
+            gib: (memory_total_gib - memory_used_gib).max(0.0),
+            color: "cyan".to_string(),
+        },
+    ]
+}
+
+fn mib_to_gib(mib: f64) -> f64 {
+    round_gib(mib / 1024.0)
+}
+
+fn command_output_text(program: &Path, args: &[&str]) -> Option<String> {
+    let mut command = ProcessCommand::new(program);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(target_os = "windows")]
+    command.creation_flags(WINDOWS_CREATE_NO_WINDOW);
+
+    let output = command.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    String::from_utf8(output.stdout).ok()
+}
+
+#[cfg(target_os = "windows")]
+fn detect_platform_gpu_blocks() -> Vec<ComputeBlock> {
+    let Some(binary) =
+        find_executable_on_path("powershell").or_else(|| find_executable_on_path("pwsh"))
+    else {
+        return Vec::new();
+    };
+    let Some(output) = command_output_text(
+        &binary,
+        &[
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_VideoController | Select-Object Name,AdapterRAM | ConvertTo-Csv -NoTypeInformation",
+        ],
+    ) else {
+        return Vec::new();
+    };
+
+    parse_windows_video_controllers(&output)
+}
+
+#[cfg(target_os = "windows")]
+fn parse_windows_video_controllers(output: &str) -> Vec<ComputeBlock> {
+    output
+        .lines()
+        .skip(1)
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let fields = parse_csv_line(line);
+            let name = fields.first()?.trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            let memory_total_gib = fields
+                .get(1)
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .filter(|bytes| *bytes > 0)
+                .map(bytes_to_gib);
+
+            Some(ComputeBlock {
+                id: format!("gpu-windows-{index}"),
+                name,
+                kind: "GPU".to_string(),
+                status: if memory_total_gib.is_some() {
+                    "Discovered via WMI; live usage unavailable".to_string()
+                } else {
+                    "Discovered via WMI".to_string()
+                },
+                utilization_percent: 0.0,
+                memory_total_gib,
                 memory_used_gib: None,
                 segments: Vec::new(),
-            },
-            ComputeBlock {
-                id: "ram".to_string(),
-                name: "System Memory".to_string(),
-                kind: "RAM".to_string(),
-                status: "Telemetry active".to_string(),
-                utilization_percent: percent(ram_used_gib, ram_total_gib),
-                memory_total_gib: Some(ram_total_gib),
-                memory_used_gib: Some(ram_used_gib),
-                segments: ram_segments,
-            },
-            ComputeBlock {
-                id: "gpu-probe".to_string(),
-                name: "Accelerator Probe".to_string(),
+            })
+        })
+        .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn detect_platform_gpu_blocks() -> Vec<ComputeBlock> {
+    let Some(binary) = find_executable_on_path("system_profiler") else {
+        return Vec::new();
+    };
+    let Some(output) = command_output_text(&binary, &["SPDisplaysDataType"]) else {
+        return Vec::new();
+    };
+
+    parse_macos_displays(&output)
+}
+
+#[cfg(target_os = "macos")]
+fn parse_macos_displays(output: &str) -> Vec<ComputeBlock> {
+    let mut blocks = Vec::new();
+    let mut current_name: Option<String> = None;
+    let mut current_vram: Option<f64> = None;
+
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Some(name) = trimmed.strip_prefix("Chipset Model:") {
+            if let Some(previous_name) = current_name.take() {
+                push_macos_gpu_block(&mut blocks, previous_name, current_vram.take());
+            }
+            current_name = Some(name.trim().to_string());
+        } else if trimmed.starts_with("VRAM") {
+            current_vram = parse_vram_gib(trimmed);
+        }
+    }
+
+    if let Some(previous_name) = current_name {
+        push_macos_gpu_block(&mut blocks, previous_name, current_vram);
+    }
+
+    blocks
+}
+
+#[cfg(target_os = "macos")]
+fn push_macos_gpu_block(
+    blocks: &mut Vec<ComputeBlock>,
+    name: String,
+    memory_total_gib: Option<f64>,
+) {
+    blocks.push(ComputeBlock {
+        id: format!("gpu-macos-{}", blocks.len()),
+        name,
+        kind: "GPU".to_string(),
+        status: "Discovered via system_profiler; live usage unavailable".to_string(),
+        utilization_percent: 0.0,
+        memory_total_gib,
+        memory_used_gib: None,
+        segments: Vec::new(),
+    });
+}
+
+#[cfg(target_os = "macos")]
+fn parse_vram_gib(line: &str) -> Option<f64> {
+    let (_, value) = line.split_once(':')?;
+    let mut parts = value.split_whitespace();
+    let amount = parts.next()?.parse::<f64>().ok()?;
+    let unit = parts.next().unwrap_or("MB").to_ascii_lowercase();
+    if unit.starts_with("gb") {
+        Some(round_gib(amount))
+    } else if unit.starts_with("mb") {
+        Some(mib_to_gib(amount))
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn detect_platform_gpu_blocks() -> Vec<ComputeBlock> {
+    let Some(binary) = find_executable_on_path("lspci") else {
+        return Vec::new();
+    };
+    let Some(output) = command_output_text(&binary, &["-mm"]) else {
+        return Vec::new();
+    };
+
+    parse_linux_lspci_gpus(&output)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_lspci_gpus(output: &str) -> Vec<ComputeBlock> {
+    output
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let fields = parse_quoted_fields(line);
+            if fields.len() < 4 {
+                return None;
+            }
+            let class = fields.get(1)?;
+            if !["VGA", "3D controller", "Display controller"]
+                .iter()
+                .any(|needle| class.contains(needle))
+            {
+                return None;
+            }
+            let vendor = fields.get(2).map(String::as_str).unwrap_or("");
+            let device = fields.get(3).map(String::as_str).unwrap_or("");
+            let name = format!("{vendor} {device}").trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+
+            Some(ComputeBlock {
+                id: format!("gpu-linux-{index}"),
+                name,
                 kind: "GPU".to_string(),
-                status: "GPU telemetry adapter not connected yet".to_string(),
+                status: "Discovered via lspci; VRAM usage unavailable".to_string(),
                 utilization_percent: 0.0,
                 memory_total_gib: None,
                 memory_used_gib: None,
                 segments: Vec::new(),
-            },
-        ],
-    })
+            })
+        })
+        .collect()
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+fn detect_platform_gpu_blocks() -> Vec<ComputeBlock> {
+    Vec::new()
+}
+
+fn parse_csv_line(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut chars = line.chars().peekable();
+    let mut in_quotes = false;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if in_quotes && matches!(chars.peek(), Some('"')) => {
+                field.push('"');
+                chars.next();
+            }
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                fields.push(field.trim().to_string());
+                field.clear();
+            }
+            _ => field.push(ch),
+        }
+    }
+    fields.push(field.trim().to_string());
+
+    fields
+}
+
+#[cfg(target_os = "linux")]
+fn parse_quoted_fields(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut in_quotes = false;
+
+    for ch in line.chars() {
+        match ch {
+            '"' => in_quotes = !in_quotes,
+            ' ' | '\t' if !in_quotes => {
+                if !field.trim().is_empty() {
+                    fields.push(field.trim().to_string());
+                    field.clear();
+                }
+            }
+            _ => field.push(ch),
+        }
+    }
+    if !field.trim().is_empty() {
+        fields.push(field.trim().to_string());
+    }
+
+    fields
 }
 
 #[tauri::command]
 fn get_runtime_metrics(engine: State<'_, EngineRuntime>) -> Result<RuntimeMetrics, String> {
     let snapshot = get_hardware_snapshot()?;
     let status = current_engine_status(&engine)?;
+    let gpu_utilization_percent = snapshot
+        .blocks
+        .iter()
+        .filter(|block| block.kind == "GPU")
+        .map(|block| block.utilization_percent)
+        .fold(0.0_f32, f32::max);
 
     Ok(RuntimeMetrics {
         active_model: status
@@ -500,7 +836,7 @@ fn get_runtime_metrics(engine: State<'_, EngineRuntime>) -> Result<RuntimeMetric
         context_used_tokens: status.context_used_tokens,
         context_total_tokens: status.context_total_tokens,
         cpu_utilization_percent: snapshot.cpu_utilization_percent,
-        gpu_utilization_percent: 0.0,
+        gpu_utilization_percent,
         ram_used_gib: snapshot.ram_used_gib,
         ram_total_gib: snapshot.ram_total_gib,
     })
@@ -3496,6 +3832,25 @@ mod tests {
             request_model_name(BACKEND_MISTRAL_RS, "Mistral Local"),
             "default"
         );
+    }
+
+    #[test]
+    fn parses_nvidia_smi_gpu_telemetry() {
+        let blocks = parse_nvidia_smi_gpus("NVIDIA RTX 4090, 57, 24564, 12000\n");
+
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].name, "NVIDIA RTX 4090");
+        assert_eq!(blocks[0].kind, "GPU");
+        assert_eq!(blocks[0].utilization_percent, 57.0);
+        assert_eq!(blocks[0].memory_total_gib, Some(24.0));
+        assert_eq!(blocks[0].memory_used_gib, Some(11.7));
+    }
+
+    #[test]
+    fn parses_quoted_csv_fields() {
+        let fields = parse_csv_line("\"Name, With Comma\",\"4294967296\"");
+
+        assert_eq!(fields, vec!["Name, With Comma", "4294967296"]);
     }
 
     #[test]
