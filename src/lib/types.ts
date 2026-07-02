@@ -213,7 +213,7 @@ export interface InferenceRunResult {
 
 export interface InferenceStreamEvent {
   requestId: string;
-  phase: "started" | "delta" | "done" | "error" | string;
+  phase: "started" | "delta" | "done" | "error" | "cancelled" | string;
   delta: string;
   content: string;
   model: string;

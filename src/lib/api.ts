@@ -366,6 +366,10 @@ export function stopLlamaServer(): Promise<EngineStatus> {
   return invokeOrPreview("stop_llama_server", fallbackEngineStatus);
 }
 
+export function cancelChatCompletionStream(requestId: string): Promise<boolean> {
+  return invokeOrPreview("cancel_chat_completion_stream", false, { requestId });
+}
+
 export function runChatCompletion(
   modelId: string,
   profile: InferenceProfile,

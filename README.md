@@ -11,7 +11,7 @@ Kivarro is a Rust/Tauri local model inference workstation for Windows, macOS, an
 - Persistent `.kivarro.json` inference profiles stored in the app config directory.
 - Profile-backed tuning controls for sampling, runtime, KV cache precision, context length, batching, mmap/mlock, and Flash Attention.
 - Model load-plan estimator for RAM pressure, KV cache allocation, runtime overhead, and GPU/CPU layer split, using GGUF layer/context metadata when available.
-- `llama-server` supervisor for loading a selected GGUF with the active profile and running OpenAI-compatible local chat completions with live token streaming into Command Center.
+- `llama-server` supervisor for loading a selected GGUF with the active profile and running OpenAI-compatible local chat completions with live token streaming and stop controls in Command Center.
 - Browser-preview fallbacks for UI smoke testing outside Tauri.
 - Windows ARM64 release bundling verified with MSI and NSIS outputs.
 
@@ -59,7 +59,7 @@ export KIVARRO_LLAMA_SERVER=/path/to/llama-server
 export KIVARRO_API_PORT=8080
 ```
 
-The Load Model action starts `llama-server` with the active `.kivarro.json` profile: model path, context length, CPU threads, batch/micro-batch, GPU layers, tensor split, KV cache precision, mmap/mlock, Flash Attention, and RoPE overrides. Prompt submission uses `POST /v1/chat/completions` on the local server with `stream: true`; the Rust backend parses the server-sent event stream and forwards token deltas to the UI over Tauri events.
+The Load Model action starts `llama-server` with the active `.kivarro.json` profile: model path, context length, CPU threads, batch/micro-batch, GPU layers, tensor split, KV cache precision, mmap/mlock, Flash Attention, and RoPE overrides. Prompt submission uses `POST /v1/chat/completions` on the local server with `stream: true`; the Rust backend parses the server-sent event stream and forwards token deltas to the UI over Tauri events. Active generations can be stopped from Command Center; Kivarro marks the stream as cancelled and closes the local SSE reader.
 
 ## Profiles
 
@@ -74,7 +74,6 @@ Profiles are saved as `.kivarro.json` files through the Tauri backend. The profi
 
 ## Next engineering milestones
 
-- Stop/cancel controls for in-flight streamed generations.
 - Native `mistral.rs` adapter and engine selection.
 - Real GPU/accelerator discovery and VRAM telemetry.
 - Built-in OpenAI-compatible proxy/server for external clients.

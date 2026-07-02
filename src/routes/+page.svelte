@@ -40,6 +40,7 @@
     Zap,
   } from "@lucide/svelte";
   import {
+    cancelChatCompletionStream,
     fallbackProfiles,
     getApiStatus,
     getEngineStatus,
@@ -128,6 +129,8 @@
   let engineBusy = false;
   let engineNotice = "";
   let promptBusy = false;
+  let generationCancelling = false;
+  let currentStreamRequestId = "";
 
   let hardware: HardwareSnapshot | null = null;
   let metrics: RuntimeMetrics | null = null;
@@ -400,6 +403,8 @@
     ];
     promptText = "";
     promptBusy = true;
+    generationCancelling = false;
+    currentStreamRequestId = requestId;
 
     try {
       const result = await runChatCompletionStream(
@@ -419,9 +424,16 @@
       engineStatus = nextEngineStatus;
       apiStatus = nextApiStatus;
     } catch (error) {
-      markAssistantError(requestId, errorMessage(error));
+      const message = errorMessage(error);
+      if (message.toLowerCase().includes("stream cancelled")) {
+        markAssistantCancelled(requestId);
+      } else {
+        markAssistantError(requestId, message);
+      }
     } finally {
       promptBusy = false;
+      generationCancelling = false;
+      currentStreamRequestId = "";
     }
   }
 
@@ -506,7 +518,7 @@
         content: event.content || message.content,
         tokens: event.completionTokens || message.tokens,
         speed: event.tokensPerSecond || message.speed,
-        streaming: event.phase !== "done" && event.phase !== "error",
+        streaming: event.phase !== "done" && event.phase !== "error" && event.phase !== "cancelled",
       };
     });
   }
@@ -537,6 +549,32 @@
         streaming: false,
       };
     });
+  }
+
+  function markAssistantCancelled(messageId: string) {
+    chatMessages = chatMessages.map((message) => {
+      if (message.id !== messageId) return message;
+
+      return {
+        ...message,
+        content: message.content || "Generation stopped before the first token.",
+        streaming: false,
+      };
+    });
+  }
+
+  async function cancelCurrentStream() {
+    if (!currentStreamRequestId || generationCancelling) return;
+
+    generationCancelling = true;
+    try {
+      const cancelled = await cancelChatCompletionStream(currentStreamRequestId);
+      if (!cancelled) {
+        addSystemMessage("Engine", "No active stream matched the current request.");
+      }
+    } catch (error) {
+      addSystemMessage("Engine", errorMessage(error));
+    }
   }
 
   function controlsFromProfile(profile: InferenceProfile) {
@@ -849,11 +887,36 @@
               placeholder="Message Kivarro or paste a benchmark prompt..."
               bind:value={promptText}
               onkeydown={(event) => {
-                if ((event.metaKey || event.ctrlKey) && event.key === "Enter") submitPrompt();
+                if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+                  event.preventDefault();
+                  if (promptBusy) {
+                    void cancelCurrentStream();
+                  } else {
+                    void submitPrompt();
+                  }
+                }
               }}
             ></textarea>
-            <button class="send-button" aria-label="Send prompt" disabled={promptBusy} onclick={submitPrompt}>
-              <Send size={18} />
+            <button
+              class:stopping={promptBusy}
+              class="send-button"
+              aria-label={promptBusy ? "Stop generation" : "Send prompt"}
+              aria-busy={generationCancelling}
+              disabled={generationCancelling}
+              title={promptBusy ? "Stop generation" : "Send prompt"}
+              onclick={() => {
+                if (promptBusy) {
+                  void cancelCurrentStream();
+                } else {
+                  void submitPrompt();
+                }
+              }}
+            >
+              {#if promptBusy}
+                <X size={18} />
+              {:else}
+                <Send size={18} />
+              {/if}
             </button>
           </div>
         </section>
@@ -2131,6 +2194,15 @@
     border-radius: 7px;
     color: #0e0e11;
     background: var(--amber);
+  }
+
+  .send-button.stopping {
+    background: var(--red);
+  }
+
+  .send-button:disabled {
+    cursor: wait;
+    opacity: 0.72;
   }
 
   .empty-state {

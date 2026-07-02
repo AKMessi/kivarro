@@ -4,12 +4,15 @@ use std::{
     collections::HashMap,
     env, fs,
     fs::File,
-    io::{Read, Seek, SeekFrom},
+    io::{ErrorKind, Read, Seek, SeekFrom},
     net::{SocketAddr, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command as ProcessCommand, Stdio},
-    sync::Mutex,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use sysinfo::System;
 use tauri::{AppHandle, Emitter, Manager, State, Window};
@@ -35,6 +38,7 @@ const HTTP_HEALTH_TIMEOUT_MS: u64 = 400;
 const HTTP_CHAT_TIMEOUT_MS: u64 = 3_600_000;
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const MAX_STREAM_RESPONSE_BYTES: u64 = 128 * 1024 * 1024;
+const STREAM_READ_POLL_MS: u64 = 200;
 const STREAM_EVENT_NAME: &str = "kivarro://chat-stream";
 
 #[cfg(target_os = "windows")]
@@ -351,6 +355,7 @@ struct StreamAccumulator {
 
 struct EngineRuntime {
     inner: Mutex<ManagedEngine>,
+    stream_cancellations: Mutex<HashMap<String, Arc<AtomicBool>>>,
 }
 
 struct ManagedEngine {
@@ -369,6 +374,7 @@ impl Default for EngineRuntime {
     fn default() -> Self {
         Self {
             inner: Mutex::new(ManagedEngine::default()),
+            stream_cancellations: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -810,6 +816,28 @@ fn stop_llama_server(engine: State<'_, EngineRuntime>) -> Result<EngineStatus, S
 }
 
 #[tauri::command]
+fn cancel_chat_completion_stream(
+    engine: State<'_, EngineRuntime>,
+    request_id: String,
+) -> Result<bool, String> {
+    let request_id = request_id.trim();
+    if request_id.is_empty() {
+        return Err("request id is required".to_string());
+    }
+
+    let guard = engine
+        .stream_cancellations
+        .lock()
+        .map_err(|_| "stream cancellation registry lock is poisoned".to_string())?;
+    if let Some(cancelled) = guard.get(request_id) {
+        cancelled.store(true, Ordering::SeqCst);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+#[tauri::command]
 fn run_chat_completion(
     engine: State<'_, EngineRuntime>,
     model_id: String,
@@ -955,8 +983,9 @@ fn run_chat_completion_stream(
     let requested_model_id = canonical_model_path(&model_id)?
         .to_string_lossy()
         .to_string();
+    let cancel_token = register_stream_cancellation(&engine, &request_id)?;
 
-    let (host, port, active_model_id, active_model_name) = {
+    let active_context = (|| -> Result<(String, u16, String, String), String> {
         let mut guard = engine
             .inner
             .lock()
@@ -974,7 +1003,7 @@ fn run_chat_completion_stream(
             return Err("llama-server is not running".to_string());
         }
 
-        (
+        Ok((
             guard.host.clone(),
             guard.port,
             active_model_id,
@@ -982,25 +1011,40 @@ fn run_chat_completion_stream(
                 .active_model_name
                 .clone()
                 .unwrap_or_else(|| "local-model".to_string()),
-        )
+        ))
+    })();
+    let (host, port, active_model_id, active_model_name) = match active_context {
+        Ok(context) => context,
+        Err(err) => {
+            unregister_stream_cancellation(&engine, &request_id);
+            return Err(err);
+        }
     };
 
     match probe_llama_health(&host, port, HTTP_HEALTH_TIMEOUT_MS) {
         HealthProbe::Ready => {}
         HealthProbe::Loading(message) => {
+            unregister_stream_cancellation(&engine, &request_id);
             return Err(format!("llama-server is still loading: {message}"));
         }
         HealthProbe::Offline(message) => {
+            unregister_stream_cancellation(&engine, &request_id);
             return Err(format!("llama-server is not reachable: {message}"));
         }
     }
 
     let started = std::time::Instant::now();
     let mut payload =
-        build_chat_completion_payload(&profile, &active_model_name, prompt, &history)?;
+        match build_chat_completion_payload(&profile, &active_model_name, prompt, &history) {
+            Ok(payload) => payload,
+            Err(err) => {
+                unregister_stream_cancellation(&engine, &request_id);
+                return Err(err);
+            }
+        };
     payload["stream"] = json!(true);
 
-    emit_stream_event(
+    if let Err(err) = emit_stream_event(
         &window,
         InferenceStreamEvent {
             request_id: request_id.clone(),
@@ -1013,7 +1057,10 @@ fn run_chat_completion_stream(
             elapsed_ms: 0,
             finish_reason: None,
         },
-    )?;
+    ) {
+        unregister_stream_cancellation(&engine, &request_id);
+        return Err(err);
+    }
 
     let mut accumulator = StreamAccumulator::default();
     let stream_result = http_sse_request(
@@ -1023,6 +1070,7 @@ fn run_chat_completion_stream(
         "/v1/chat/completions",
         &payload,
         HTTP_CHAT_TIMEOUT_MS,
+        &cancel_token,
         |value| {
             let chunk = extract_stream_chunk(&value);
             if !chunk.delta.is_empty() {
@@ -1055,24 +1103,36 @@ fn run_chat_completion_stream(
     );
 
     if let Err(err) = stream_result {
-        emit_stream_event(
+        let was_cancelled = cancel_token.load(Ordering::SeqCst);
+        let phase = if was_cancelled { "cancelled" } else { "error" };
+        let emit_result = emit_stream_event(
             &window,
             InferenceStreamEvent {
-                request_id,
-                phase: "error".to_string(),
+                request_id: request_id.clone(),
+                phase: phase.to_string(),
                 delta: String::new(),
                 content: accumulator.content,
                 model: active_model_name,
                 completion_tokens: accumulator.completion_tokens,
                 tokens_per_second: 0.0,
                 elapsed_ms: started.elapsed().as_millis(),
-                finish_reason: Some(err.clone()),
+                finish_reason: Some(if was_cancelled {
+                    "cancelled".to_string()
+                } else {
+                    err.clone()
+                }),
             },
-        )?;
+        );
+        unregister_stream_cancellation(&engine, &request_id);
+        emit_result?;
+        if was_cancelled {
+            return Err("stream cancelled".to_string());
+        }
         return Err(err);
     }
 
     if accumulator.content.is_empty() {
+        unregister_stream_cancellation(&engine, &request_id);
         return Err("llama-server returned an empty streamed completion".to_string());
     }
 
@@ -1096,7 +1156,7 @@ fn run_chat_completion_stream(
         guard.last_error = None;
     }
 
-    emit_stream_event(
+    let emit_result = emit_stream_event(
         &window,
         InferenceStreamEvent {
             request_id: request_id.clone(),
@@ -1109,7 +1169,9 @@ fn run_chat_completion_stream(
             elapsed_ms,
             finish_reason: accumulator.finish_reason.clone(),
         },
-    )?;
+    );
+    unregister_stream_cancellation(&engine, &request_id);
+    emit_result?;
 
     Ok(InferenceRunResult {
         content: accumulator.content,
@@ -1532,6 +1594,25 @@ fn configured_api_port() -> u16 {
         .and_then(|value| value.trim().parse::<u16>().ok())
         .filter(|port| *port > 0)
         .unwrap_or(DEFAULT_API_PORT)
+}
+
+fn register_stream_cancellation(
+    engine: &State<'_, EngineRuntime>,
+    request_id: &str,
+) -> Result<Arc<AtomicBool>, String> {
+    let token = Arc::new(AtomicBool::new(false));
+    let mut guard = engine
+        .stream_cancellations
+        .lock()
+        .map_err(|_| "stream cancellation registry lock is poisoned".to_string())?;
+    guard.insert(request_id.to_string(), Arc::clone(&token));
+    Ok(token)
+}
+
+fn unregister_stream_cancellation(engine: &State<'_, EngineRuntime>, request_id: &str) {
+    if let Ok(mut guard) = engine.stream_cancellations.lock() {
+        guard.remove(request_id);
+    }
 }
 
 fn current_engine_status(engine: &State<'_, EngineRuntime>) -> Result<EngineStatus, String> {
@@ -2100,6 +2181,7 @@ fn http_sse_request<F>(
     path: &str,
     body: &Value,
     timeout_ms: u64,
+    cancel_token: &AtomicBool,
     mut on_value: F,
 ) -> Result<(), String>
 where
@@ -2146,9 +2228,17 @@ where
         ));
     }
 
+    stream
+        .set_read_timeout(Some(Duration::from_millis(STREAM_READ_POLL_MS)))
+        .map_err(|err| format!("failed to set stream read poll timeout: {err}"))?;
+
     let mut sse_buffer = Vec::new();
     let mut bytes_seen = 0_u64;
+    let read_deadline = Instant::now() + timeout;
     let mut process_chunk = |chunk: &[u8]| -> Result<bool, String> {
+        if cancel_token.load(Ordering::SeqCst) {
+            return Err("stream cancelled".to_string());
+        }
         bytes_seen = bytes_seen.saturating_add(chunk.len() as u64);
         if bytes_seen > MAX_STREAM_RESPONSE_BYTES {
             return Err(format!(
@@ -2165,9 +2255,21 @@ where
         .map(|value| value.contains("chunked"))
         .unwrap_or(false)
     {
-        read_chunked_transfer(&mut stream, MAX_STREAM_RESPONSE_BYTES, &mut process_chunk)?;
+        read_chunked_transfer(
+            &mut stream,
+            MAX_STREAM_RESPONSE_BYTES,
+            Some(cancel_token),
+            Some(read_deadline),
+            &mut process_chunk,
+        )?;
     } else {
-        read_stream_body(&mut stream, MAX_STREAM_RESPONSE_BYTES, &mut process_chunk)?;
+        read_stream_body(
+            &mut stream,
+            MAX_STREAM_RESPONSE_BYTES,
+            Some(cancel_token),
+            Some(read_deadline),
+            &mut process_chunk,
+        )?;
     }
 
     if !sse_buffer.is_empty() {
@@ -2235,12 +2337,12 @@ fn read_remaining_http_body(
         .map(|value| value.contains("chunked"))
         .unwrap_or(false)
     {
-        read_chunked_transfer(stream, max_bytes, |chunk| {
+        read_chunked_transfer(stream, max_bytes, None, None, |chunk| {
             body.extend_from_slice(chunk);
             Ok(true)
         })?;
     } else {
-        read_stream_body(stream, max_bytes, |chunk| {
+        read_stream_body(stream, max_bytes, None, None, |chunk| {
             body.extend_from_slice(chunk);
             Ok(true)
         })?;
@@ -2252,6 +2354,8 @@ fn read_remaining_http_body(
 fn read_stream_body<F>(
     stream: &mut TcpStream,
     max_bytes: u64,
+    cancel_token: Option<&AtomicBool>,
+    deadline: Option<Instant>,
     mut on_chunk: F,
 ) -> Result<(), String>
 where
@@ -2260,9 +2364,19 @@ where
     let mut bytes_seen = 0_u64;
     let mut buffer = [0_u8; 8192];
     loop {
-        let count = stream
-            .read(&mut buffer)
-            .map_err(|err| format!("failed to read HTTP response body: {err}"))?;
+        if cancel_token
+            .map(|token| token.load(Ordering::SeqCst))
+            .unwrap_or(false)
+        {
+            return Err("stream cancelled".to_string());
+        }
+        let count = read_with_optional_cancel(
+            stream,
+            &mut buffer,
+            cancel_token,
+            deadline,
+            "failed to read HTTP response body",
+        )?;
         if count == 0 {
             return Ok(());
         }
@@ -2279,6 +2393,8 @@ where
 fn read_chunked_transfer<F>(
     stream: &mut TcpStream,
     max_bytes: u64,
+    cancel_token: Option<&AtomicBool>,
+    deadline: Option<Instant>,
     mut on_chunk: F,
 ) -> Result<(), String>
 where
@@ -2286,7 +2402,13 @@ where
 {
     let mut bytes_seen = 0_u64;
     loop {
-        let Some(size_line) = read_http_line(stream)? else {
+        if cancel_token
+            .map(|token| token.load(Ordering::SeqCst))
+            .unwrap_or(false)
+        {
+            return Err("stream cancelled".to_string());
+        }
+        let Some(size_line) = read_http_line(stream, cancel_token, deadline)? else {
             return Err("chunked response ended before chunk size".to_string());
         };
         let size_text = String::from_utf8_lossy(&size_line);
@@ -2294,7 +2416,7 @@ where
         let size = usize::from_str_radix(size_hex, 16)
             .map_err(|err| format!("invalid chunk size {size_hex}: {err}"))?;
         if size == 0 {
-            consume_trailing_chunk_headers(stream)?;
+            consume_trailing_chunk_headers(stream, cancel_token, deadline)?;
             return Ok(());
         }
 
@@ -2304,13 +2426,21 @@ where
         }
 
         let mut chunk = vec![0_u8; size];
-        stream
-            .read_exact(&mut chunk)
-            .map_err(|err| format!("failed to read chunk data: {err}"))?;
+        read_exact_with_optional_cancel(
+            stream,
+            &mut chunk,
+            cancel_token,
+            deadline,
+            "failed to read chunk data",
+        )?;
         let mut crlf = [0_u8; 2];
-        stream
-            .read_exact(&mut crlf)
-            .map_err(|err| format!("failed to read chunk terminator: {err}"))?;
+        read_exact_with_optional_cancel(
+            stream,
+            &mut crlf,
+            cancel_token,
+            deadline,
+            "failed to read chunk terminator",
+        )?;
         if crlf != *b"\r\n" {
             return Err("chunked response contained an invalid chunk terminator".to_string());
         }
@@ -2321,13 +2451,21 @@ where
     }
 }
 
-fn read_http_line(stream: &mut TcpStream) -> Result<Option<Vec<u8>>, String> {
+fn read_http_line(
+    stream: &mut TcpStream,
+    cancel_token: Option<&AtomicBool>,
+    deadline: Option<Instant>,
+) -> Result<Option<Vec<u8>>, String> {
     let mut line = Vec::new();
     let mut byte = [0_u8; 1];
     loop {
-        let count = stream
-            .read(&mut byte)
-            .map_err(|err| format!("failed to read HTTP line: {err}"))?;
+        let count = read_with_optional_cancel(
+            stream,
+            &mut byte,
+            cancel_token,
+            deadline,
+            "failed to read HTTP line",
+        )?;
         if count == 0 {
             return if line.is_empty() {
                 Ok(None)
@@ -2349,14 +2487,79 @@ fn read_http_line(stream: &mut TcpStream) -> Result<Option<Vec<u8>>, String> {
     }
 }
 
-fn consume_trailing_chunk_headers(stream: &mut TcpStream) -> Result<(), String> {
-    while let Some(line) = read_http_line(stream)? {
+fn consume_trailing_chunk_headers(
+    stream: &mut TcpStream,
+    cancel_token: Option<&AtomicBool>,
+    deadline: Option<Instant>,
+) -> Result<(), String> {
+    while let Some(line) = read_http_line(stream, cancel_token, deadline)? {
         if line.is_empty() {
             return Ok(());
         }
     }
 
     Ok(())
+}
+
+fn read_exact_with_optional_cancel(
+    stream: &mut TcpStream,
+    buffer: &mut [u8],
+    cancel_token: Option<&AtomicBool>,
+    deadline: Option<Instant>,
+    context: &str,
+) -> Result<(), String> {
+    let mut offset = 0;
+    while offset < buffer.len() {
+        let count = read_with_optional_cancel(
+            stream,
+            &mut buffer[offset..],
+            cancel_token,
+            deadline,
+            context,
+        )?;
+        if count == 0 {
+            return Err(format!(
+                "{context}: connection closed before expected bytes"
+            ));
+        }
+        offset += count;
+    }
+
+    Ok(())
+}
+
+fn read_with_optional_cancel(
+    stream: &mut TcpStream,
+    buffer: &mut [u8],
+    cancel_token: Option<&AtomicBool>,
+    deadline: Option<Instant>,
+    context: &str,
+) -> Result<usize, String> {
+    loop {
+        if cancel_token
+            .map(|token| token.load(Ordering::SeqCst))
+            .unwrap_or(false)
+        {
+            return Err("stream cancelled".to_string());
+        }
+        if deadline
+            .map(|deadline| Instant::now() >= deadline)
+            .unwrap_or(false)
+        {
+            return Err(format!("{context}: read timed out"));
+        }
+
+        match stream.read(buffer) {
+            Ok(count) => return Ok(count),
+            Err(err)
+                if cancel_token.is_some()
+                    && matches!(err.kind(), ErrorKind::TimedOut | ErrorKind::WouldBlock) =>
+            {
+                continue;
+            }
+            Err(err) => return Err(format!("{context}: {err}")),
+        }
+    }
 }
 
 fn process_sse_bytes<F>(
@@ -3012,6 +3215,7 @@ fn percent(used: f64, total: f64) -> f32 {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::net::TcpListener;
 
     #[test]
     fn parses_minimal_gguf_metadata() {
@@ -3148,6 +3352,49 @@ mod tests {
         assert!(chunk.finish_reason.is_none());
     }
 
+    #[test]
+    fn cancels_idle_sse_stream_promptly() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind SSE test listener");
+        let port = listener
+            .local_addr()
+            .expect("read SSE test listener address")
+            .port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept SSE test connection");
+            let mut request = [0_u8; 512];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n",
+                )
+                .expect("write SSE response head");
+            std::thread::sleep(Duration::from_millis(1_500));
+        });
+
+        let cancel_token = Arc::new(AtomicBool::new(false));
+        let canceller = Arc::clone(&cancel_token);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            canceller.store(true, Ordering::SeqCst);
+        });
+
+        let started = Instant::now();
+        let result = http_sse_request(
+            "127.0.0.1",
+            port,
+            "POST",
+            "/v1/chat/completions",
+            &json!({ "stream": true }),
+            10_000,
+            &cancel_token,
+            |_| Ok(true),
+        );
+
+        assert!(matches!(result, Err(ref err) if err == "stream cancelled"));
+        assert!(started.elapsed() < Duration::from_millis(1_000));
+        server.join().expect("join SSE test server");
+    }
+
     fn push_gguf_string_kv(bytes: &mut Vec<u8>, key: &str, value: &str) {
         push_gguf_string(bytes, key);
         bytes.extend_from_slice(&GGUF_VALUE_TYPE_STRING.to_le_bytes());
@@ -3196,6 +3443,7 @@ pub fn run() {
             get_engine_status,
             start_llama_server,
             stop_llama_server,
+            cancel_chat_completion_stream,
             run_chat_completion,
             run_chat_completion_stream,
             get_api_status,
