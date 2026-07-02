@@ -13,6 +13,7 @@ Kivarro is a Rust/Tauri local model inference workstation for Windows, macOS, an
 - Profile-backed tuning controls for sampling, runtime, KV cache precision, context length, batching, mmap/mlock, and Flash Attention.
 - Model load-plan estimator for RAM pressure, KV cache allocation, runtime overhead, and GPU/CPU layer split, using GGUF layer/context metadata when available.
 - Engine supervisor for loading a selected local model through either `llama.cpp` `llama-server` or `mistral.rs` `mistralrs serve`, with OpenAI-compatible chat completions, live token streaming, and stop controls in Command Center.
+- Persisted Local API host/port configuration with status-bar synchronization and copyable OpenAI-compatible base URL.
 - Tokens/sec benchmark runner for the loaded model, persisted under the app config directory with eval count, eval duration, tokens/sec, and load duration.
 - Local RAG knowledge bases with persisted document metadata, UTF-8 text/Markdown/source ingestion, deterministic chunking, and retrieval test ranking.
 - Browser-preview fallbacks for UI smoke testing outside Tauri.
@@ -66,7 +67,9 @@ export KIVARRO_MISTRALRS=/path/to/mistralrs
 export KIVARRO_API_PORT=8080
 ```
 
-The Load Model action starts the selected backend with the active `.kivarro.json` profile. `llama.cpp` launches `llama-server` with model path, context length, CPU threads, batch/micro-batch, GPU layers, tensor split, KV cache precision, mmap/mlock, Flash Attention, and RoPE overrides. `mistral.rs` launches `mistralrs serve -m <model> --host 127.0.0.1 -p <port> --no-ui` and uses the single-model OpenAI-compatible request id `default`.
+The Local API view persists the host and port to the app config directory. `KIVARRO_API_PORT` is used as the initial/default port when no saved setting exists. Stop the loaded model before changing the endpoint, then load the model again to start the backend on the new host/port.
+
+The Load Model action starts the selected backend with the active `.kivarro.json` profile. `llama.cpp` launches `llama-server` with model path, context length, CPU threads, batch/micro-batch, GPU layers, tensor split, KV cache precision, mmap/mlock, Flash Attention, and RoPE overrides. `mistral.rs` launches `mistralrs serve -m <model> --host <configured-host> -p <configured-port> --no-ui` and uses the single-model OpenAI-compatible request id `default`.
 
 Prompt submission uses `POST /v1/chat/completions` on the local server with `stream: true`; the Rust backend parses the server-sent event stream and forwards token deltas to the UI over Tauri events. Active generations can be stopped from Command Center; Kivarro marks the stream as cancelled and closes the local SSE reader.
 

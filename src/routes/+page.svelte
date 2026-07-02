@@ -43,6 +43,7 @@
     cancelChatCompletionStream,
     fallbackProfiles,
     createKnowledgeBase,
+    getApiSettings,
     getApiStatus,
     getEngineStatus,
     getHardwareSnapshot,
@@ -57,12 +58,14 @@
     listSystemLogs,
     runBenchmark,
     runChatCompletionStream,
+    saveApiSettings,
     saveInferenceProfile,
     startInferenceEngine,
     stopInferenceEngine,
     testKnowledgeRetrieval,
   } from "$lib/api";
   import type {
+    ApiSettings,
     ApiStatus,
     BenchmarkResult,
     ChatTurn,
@@ -139,8 +142,10 @@
   let promptBusy = false;
   let benchmarkBusy = false;
   let knowledgeBusy = false;
+  let apiConfigBusy = false;
   let generationCancelling = false;
   let currentStreamRequestId = "";
+  let apiCopyStatus = "Copy";
   let selectedKnowledgeBaseId = "";
   let knowledgeImportPath = "";
   let newKnowledgeBaseName = "";
@@ -152,6 +157,7 @@
   let profiles: InferenceProfile[] = fallbackProfiles;
   let loadPlan: ModelLoadPlan | null = null;
   let apiStatus: ApiStatus | null = null;
+  let apiSettings: ApiSettings = { host: "127.0.0.1", port: 8080 };
   let engineStatus: EngineStatus | null = null;
   let benchmarks: BenchmarkResult[] = [];
   let logs: LogEntry[] = [];
@@ -206,8 +212,10 @@
     logFilter === "ALL" ? logs : logs.filter((entry) => entry.level.toUpperCase() === logFilter);
   $: activeKnowledgeBase =
     knowledgeBases.find((base) => base.id === selectedKnowledgeBaseId) ?? knowledgeBases[0] ?? null;
+  $: configuredBaseUrl = apiStatus?.baseUrl ?? `http://${apiSettings.host}:${apiSettings.port}/v1`;
   $: engineOnline = engineStatus?.state === "ready";
   $: engineLoading = engineStatus?.state === "loading";
+  $: apiEndpointLocked = engineOnline || engineLoading || Boolean(apiStatus?.enabled);
   $: engineLabel = engineBusy
     ? "Starting"
     : engineOnline
@@ -258,6 +266,7 @@
       nextModels,
       nextProfiles,
       nextApiStatus,
+      nextApiSettings,
       nextEngineStatus,
       nextBenchmarks,
       nextKnowledgeBases,
@@ -269,6 +278,7 @@
         listModels(),
         listInferenceProfiles(),
         getApiStatus(),
+        getApiSettings(),
         getEngineStatus(),
         listBenchmarkResults(),
         listKnowledgeBases(),
@@ -283,6 +293,7 @@
     sampling = controlsFromProfile(profiles[0] ?? fallbackProfiles[0]);
     selectedModelId = nextModels[0]?.id ?? "";
     apiStatus = nextApiStatus;
+    apiSettings = nextApiSettings;
     engineStatus = nextEngineStatus;
     engineNotice = nextEngineStatus.message;
     benchmarks = nextBenchmarks;
@@ -415,6 +426,43 @@
       addSystemMessage("Engine", engineNotice);
     } finally {
       engineBusy = false;
+    }
+  }
+
+  async function saveCurrentApiSettings() {
+    if (apiConfigBusy) return;
+
+    const nextSettings: ApiSettings = {
+      host: apiSettings.host.trim(),
+      port: Number(apiSettings.port),
+    };
+    apiConfigBusy = true;
+    try {
+      apiStatus = await saveApiSettings(nextSettings);
+      apiSettings = await getApiSettings();
+      const [nextMetrics, nextEngineStatus] = await Promise.all([
+        getRuntimeMetrics(),
+        getEngineStatus(),
+      ]);
+      metrics = nextMetrics;
+      engineStatus = nextEngineStatus;
+      engineNotice = nextEngineStatus.message;
+      apiCopyStatus = "Saved";
+    } catch (error) {
+      addSystemMessage("API", errorMessage(error));
+      apiCopyStatus = "Save failed";
+    } finally {
+      apiConfigBusy = false;
+    }
+  }
+
+  async function copyBaseUrl() {
+    try {
+      await navigator.clipboard.writeText(configuredBaseUrl);
+      apiCopyStatus = "Copied";
+    } catch (error) {
+      addSystemMessage("API", `Clipboard unavailable: ${errorMessage(error)}`);
+      apiCopyStatus = "Copy failed";
     }
   }
 
@@ -1524,10 +1572,42 @@
         </section>
 
         <section class="api-dashboard">
+          <div class="api-config-grid">
+            <label>
+              <span>Host</span>
+              <input
+                aria-label="API host"
+                disabled={apiConfigBusy || apiEndpointLocked}
+                bind:value={apiSettings.host}
+              />
+            </label>
+            <label>
+              <span>Port</span>
+              <input
+                aria-label="API port"
+                type="number"
+                min="1"
+                max="65535"
+                step="1"
+                disabled={apiConfigBusy || apiEndpointLocked}
+                bind:value={apiSettings.port}
+              />
+            </label>
+            <button class="primary-button" disabled={apiConfigBusy || apiEndpointLocked} onclick={saveCurrentApiSettings}>
+              <Server size={15} />
+              {apiConfigBusy ? "Saving" : "Save endpoint"}
+            </button>
+          </div>
+          {#if apiEndpointLocked}
+            <p class="muted-copy">Stop the running local API server before changing host or port.</p>
+          {/if}
           <div class="api-url">
             <span>Base URL</span>
-            <code>{apiStatus?.baseUrl ?? "http://127.0.0.1:8080/v1"}</code>
-            <button aria-label="Copy base URL"><Clipboard size={15} /></button>
+            <code>{configuredBaseUrl}</code>
+            <button aria-label="Copy base URL" onclick={copyBaseUrl}>
+              <Clipboard size={15} />
+              <small>{apiCopyStatus}</small>
+            </button>
           </div>
           <div class="endpoint-table">
             {#each apiStatus?.endpoints ?? [] as endpoint}
@@ -2873,16 +2953,37 @@
     padding: 14px;
   }
 
+  .api-config-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.2fr) minmax(120px, 0.45fr) auto;
+    gap: 10px;
+    align-items: end;
+  }
+
+  .api-config-grid label {
+    display: grid;
+    gap: 6px;
+  }
+
   .api-url {
-    grid-template-columns: 90px minmax(0, 1fr) 34px;
+    grid-template-columns: 90px minmax(0, 1fr) 92px;
   }
 
   .api-url button {
     height: 30px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
     border: 1px solid var(--border);
     border-radius: 6px;
     background: var(--panel-2);
     color: var(--text);
+  }
+
+  .api-url small {
+    font-size: 11px;
+    color: var(--muted);
   }
 
   .endpoint-table {
@@ -3147,6 +3248,7 @@
     .agent-canvas,
     .settings-grid,
     .tool-permissions,
+    .api-config-grid,
     .load-plan-grid,
     .allocation-grid,
     .runtime-grid {

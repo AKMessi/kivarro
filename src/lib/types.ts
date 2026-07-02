@@ -176,6 +176,11 @@ export interface ApiStatus {
   endpoints: ApiEndpoint[];
 }
 
+export interface ApiSettings {
+  host: string;
+  port: number;
+}
+
 export interface EngineStatus {
   backend: string;
   state: string;

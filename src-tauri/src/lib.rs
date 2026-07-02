@@ -21,6 +21,7 @@ use tauri::{AppHandle, Emitter, Manager, State, Window};
 use std::os::windows::process::CommandExt;
 
 const PROFILE_EXTENSION: &str = "kivarro.json";
+const API_SETTINGS_FILE: &str = "api-settings.json";
 const BENCHMARK_RESULTS_FILE: &str = "benchmarks.json";
 const MAX_BENCHMARK_RESULTS: usize = 200;
 const KNOWLEDGE_STORE_FILE: &str = "knowledge-store.json";
@@ -266,6 +267,13 @@ struct ApiStatus {
     port: u16,
     base_url: String,
     endpoints: Vec<ApiEndpoint>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct ApiSettings {
+    host: String,
+    port: u16,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -883,7 +891,12 @@ fn parse_quoted_fields(line: &str) -> Vec<String> {
 }
 
 #[tauri::command]
-fn get_runtime_metrics(engine: State<'_, EngineRuntime>) -> Result<RuntimeMetrics, String> {
+fn get_runtime_metrics(
+    app_handle: AppHandle,
+    engine: State<'_, EngineRuntime>,
+) -> Result<RuntimeMetrics, String> {
+    let settings = read_api_settings(&app_handle)?;
+    sync_engine_endpoint_if_idle(&engine, &settings)?;
     let snapshot = get_hardware_snapshot()?;
     let status = current_engine_status(&engine)?;
     let gpu_utilization_percent = snapshot
@@ -1147,30 +1160,38 @@ fn get_model_load_plan(
 }
 
 #[tauri::command]
-fn get_engine_status(engine: State<'_, EngineRuntime>) -> Result<EngineStatus, String> {
+fn get_engine_status(
+    app_handle: AppHandle,
+    engine: State<'_, EngineRuntime>,
+) -> Result<EngineStatus, String> {
+    let settings = read_api_settings(&app_handle)?;
+    sync_engine_endpoint_if_idle(&engine, &settings)?;
     current_engine_status(&engine)
 }
 
 #[tauri::command]
 fn start_inference_engine(
+    app_handle: AppHandle,
     engine: State<'_, EngineRuntime>,
     model_id: String,
     profile: InferenceProfile,
 ) -> Result<EngineStatus, String> {
     let backend = profile_backend(&profile)?;
-    start_engine_for_backend(engine, model_id, profile, backend)
+    start_engine_for_backend(&app_handle, engine, model_id, profile, backend)
 }
 
 #[tauri::command]
 fn start_llama_server(
+    app_handle: AppHandle,
     engine: State<'_, EngineRuntime>,
     model_id: String,
     profile: InferenceProfile,
 ) -> Result<EngineStatus, String> {
-    start_engine_for_backend(engine, model_id, profile, BACKEND_LLAMA_CPP)
+    start_engine_for_backend(&app_handle, engine, model_id, profile, BACKEND_LLAMA_CPP)
 }
 
 fn start_engine_for_backend(
+    app_handle: &AppHandle,
     engine: State<'_, EngineRuntime>,
     model_id: String,
     mut profile: InferenceProfile,
@@ -1189,8 +1210,9 @@ fn start_engine_for_backend(
         find_engine_binary(backend).ok_or_else(|| engine_binary_missing_message(backend))?;
     let model_name = model_display_name_from_path(&model_path);
     let request_model = request_model_name(backend, &model_name);
-    let port = configured_api_port();
-    let host = DEFAULT_API_HOST.to_string();
+    let api_settings = read_api_settings(app_handle)?;
+    let port = api_settings.port;
+    let host = api_settings.host;
     let args = build_engine_args(backend, &model_path, &profile, &host, port);
 
     let mut guard = engine
@@ -1245,7 +1267,11 @@ fn start_engine_for_backend(
 }
 
 #[tauri::command]
-fn stop_inference_engine(engine: State<'_, EngineRuntime>) -> Result<EngineStatus, String> {
+fn stop_inference_engine(
+    app_handle: AppHandle,
+    engine: State<'_, EngineRuntime>,
+) -> Result<EngineStatus, String> {
+    let settings = read_api_settings(&app_handle)?;
     let mut guard = engine
         .inner
         .lock()
@@ -1260,6 +1286,8 @@ fn stop_inference_engine(engine: State<'_, EngineRuntime>) -> Result<EngineStatu
     guard.last_error = None;
     guard.last_tokens_per_second = 0.0;
     guard.context_used_tokens = 0;
+    guard.host = settings.host;
+    guard.port = settings.port;
     let backend = guard.active_backend.clone();
 
     Ok(engine_status_from_guard(
@@ -1269,8 +1297,11 @@ fn stop_inference_engine(engine: State<'_, EngineRuntime>) -> Result<EngineStatu
 }
 
 #[tauri::command]
-fn stop_llama_server(engine: State<'_, EngineRuntime>) -> Result<EngineStatus, String> {
-    stop_inference_engine(engine)
+fn stop_llama_server(
+    app_handle: AppHandle,
+    engine: State<'_, EngineRuntime>,
+) -> Result<EngineStatus, String> {
+    stop_inference_engine(app_handle, engine)
 }
 
 #[tauri::command]
@@ -1620,7 +1651,43 @@ fn run_chat_completion_stream(
 }
 
 #[tauri::command]
-fn get_api_status(engine: State<'_, EngineRuntime>) -> Result<ApiStatus, String> {
+fn get_api_settings(app_handle: AppHandle) -> Result<ApiSettings, String> {
+    read_api_settings(&app_handle)
+}
+
+#[tauri::command]
+fn save_api_settings(
+    app_handle: AppHandle,
+    engine: State<'_, EngineRuntime>,
+    settings: ApiSettings,
+) -> Result<ApiStatus, String> {
+    let settings = normalize_api_settings(settings)?;
+
+    {
+        let mut guard = engine
+            .inner
+            .lock()
+            .map_err(|_| "engine state lock is poisoned".to_string())?;
+        refresh_engine_process(&mut guard);
+        let endpoint_changed = guard.host != settings.host || guard.port != settings.port;
+        if guard.child.is_some() && endpoint_changed {
+            return Err("Stop the running API server before changing host or port.".to_string());
+        }
+        guard.host = settings.host.clone();
+        guard.port = settings.port;
+    }
+
+    write_api_settings(&app_handle, &settings)?;
+    get_api_status(app_handle, engine)
+}
+
+#[tauri::command]
+fn get_api_status(
+    app_handle: AppHandle,
+    engine: State<'_, EngineRuntime>,
+) -> Result<ApiStatus, String> {
+    let settings = read_api_settings(&app_handle)?;
+    sync_engine_endpoint_if_idle(&engine, &settings)?;
     let status = current_engine_status(&engine)?;
 
     Ok(ApiStatus {
@@ -1911,6 +1978,94 @@ fn profile_directory(app_handle: &AppHandle) -> Result<PathBuf, String> {
         .app_config_dir()
         .map(|path| path.join("profiles"))
         .map_err(|err| format!("failed to resolve app profile directory: {err}"))
+}
+
+fn api_settings_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
+    app_handle
+        .path()
+        .app_config_dir()
+        .map(|path| path.join(API_SETTINGS_FILE))
+        .map_err(|err| format!("failed to resolve API settings path: {err}"))
+}
+
+fn default_api_settings() -> ApiSettings {
+    ApiSettings {
+        host: DEFAULT_API_HOST.to_string(),
+        port: configured_api_port(),
+    }
+}
+
+fn read_api_settings(app_handle: &AppHandle) -> Result<ApiSettings, String> {
+    let path = api_settings_path(app_handle)?;
+    if !path.exists() {
+        return Ok(default_api_settings());
+    }
+
+    let raw = fs::read_to_string(&path)
+        .map_err(|err| format!("failed to read API settings {}: {err}", path.display()))?;
+    if raw.trim().is_empty() {
+        return Ok(default_api_settings());
+    }
+
+    let settings = serde_json::from_str::<ApiSettings>(&raw)
+        .map_err(|err| format!("failed to parse API settings {}: {err}", path.display()))?;
+    normalize_api_settings(settings)
+}
+
+fn write_api_settings(app_handle: &AppHandle, settings: &ApiSettings) -> Result<(), String> {
+    let path = api_settings_path(app_handle)?;
+    let Some(directory) = path.parent() else {
+        return Err("API settings path has no parent directory".to_string());
+    };
+    fs::create_dir_all(directory).map_err(|err| {
+        format!(
+            "failed to create API settings directory {}: {err}",
+            directory.display()
+        )
+    })?;
+    let encoded = serde_json::to_string_pretty(settings)
+        .map_err(|err| format!("failed to encode API settings: {err}"))?;
+    fs::write(&path, encoded)
+        .map_err(|err| format!("failed to write API settings {}: {err}", path.display()))
+}
+
+fn normalize_api_settings(settings: ApiSettings) -> Result<ApiSettings, String> {
+    let host = settings.host.trim();
+    if host.is_empty() {
+        return Err("API host is required".to_string());
+    }
+    if host.chars().any(char::is_whitespace) {
+        return Err("API host cannot contain whitespace".to_string());
+    }
+    if settings.port == 0 {
+        return Err("API port must be between 1 and 65535".to_string());
+    }
+
+    Ok(ApiSettings {
+        host: host.to_string(),
+        port: settings.port,
+    })
+}
+
+fn sync_engine_endpoint_if_idle(
+    engine: &State<'_, EngineRuntime>,
+    settings: &ApiSettings,
+) -> Result<(), String> {
+    let mut guard = engine
+        .inner
+        .lock()
+        .map_err(|_| "engine state lock is poisoned".to_string())?;
+    refresh_engine_process(&mut guard);
+    if guard.child.is_none() {
+        guard.host = settings.host.clone();
+        guard.port = settings.port;
+    }
+
+    Ok(())
+}
+
+fn api_base_url(host: &str, port: u16) -> String {
+    format!("http://{host}:{port}/v1")
 }
 
 fn benchmark_results_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
@@ -2738,7 +2893,7 @@ fn engine_status_from_guard(
         active_model_name: guard.active_model_name.clone(),
         host: guard.host.clone(),
         port: guard.port,
-        base_url: format!("http://{}:{}/v1", guard.host, guard.port),
+        base_url: api_base_url(&guard.host, guard.port),
         health_ok,
         last_tokens_per_second: guard.last_tokens_per_second,
         context_used_tokens: guard.context_used_tokens,
@@ -4487,6 +4642,36 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_api_settings_and_base_url() {
+        let settings = normalize_api_settings(ApiSettings {
+            host: "  localhost ".to_string(),
+            port: 9099,
+        })
+        .expect("valid API settings");
+
+        assert_eq!(settings.host, "localhost");
+        assert_eq!(settings.port, 9099);
+        assert_eq!(
+            api_base_url(&settings.host, settings.port),
+            "http://localhost:9099/v1"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_api_settings() {
+        assert!(normalize_api_settings(ApiSettings {
+            host: "local host".to_string(),
+            port: 8080,
+        })
+        .is_err());
+        assert!(normalize_api_settings(ApiSettings {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+        })
+        .is_err());
+    }
+
+    #[test]
     fn parses_nvidia_smi_gpu_telemetry() {
         let blocks = parse_nvidia_smi_gpus("NVIDIA RTX 4090, 57, 24564, 12000\n");
 
@@ -4684,6 +4869,8 @@ pub fn run() {
             cancel_chat_completion_stream,
             run_chat_completion,
             run_chat_completion_stream,
+            get_api_settings,
+            save_api_settings,
             get_api_status,
             run_benchmark,
             list_benchmark_results,

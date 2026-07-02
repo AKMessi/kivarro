@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  ApiSettings,
   ApiStatus,
   BenchmarkResult,
   ChatTurn,
@@ -72,6 +73,11 @@ const fallbackApiStatus: ApiStatus = {
       status: "Planned",
     },
   ],
+};
+
+const fallbackApiSettings: ApiSettings = {
+  host: "127.0.0.1",
+  port: 8080,
 };
 
 const fallbackEngineStatus: EngineStatus = {
@@ -363,6 +369,22 @@ export function getModelLoadPlan(
 
 export function getApiStatus(): Promise<ApiStatus> {
   return safeInvoke("get_api_status", fallbackApiStatus);
+}
+
+export function getApiSettings(): Promise<ApiSettings> {
+  return safeInvoke("get_api_settings", fallbackApiSettings);
+}
+
+export function saveApiSettings(settings: ApiSettings): Promise<ApiStatus> {
+  return invokeOrPreview(
+    "save_api_settings",
+    {
+      ...fallbackApiStatus,
+      port: settings.port,
+      baseUrl: `http://${settings.host}:${settings.port}/v1`,
+    },
+    { settings },
+  );
 }
 
 export function getEngineStatus(): Promise<EngineStatus> {
