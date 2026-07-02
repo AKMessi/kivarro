@@ -211,6 +211,18 @@ export interface InferenceRunResult {
   finishReason?: string | null;
 }
 
+export interface InferenceStreamEvent {
+  requestId: string;
+  phase: "started" | "delta" | "done" | "error" | string;
+  delta: string;
+  content: string;
+  model: string;
+  completionTokens: number;
+  tokensPerSecond: number;
+  elapsedMs: number;
+  finishReason?: string | null;
+}
+
 export interface BenchmarkResult {
   model: string;
   backend: string;

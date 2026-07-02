@@ -12,7 +12,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use sysinfo::System;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State, Window};
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -33,6 +33,9 @@ const API_PORT_ENV: &str = "KIVARRO_API_PORT";
 const MAX_HTTP_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 const HTTP_HEALTH_TIMEOUT_MS: u64 = 400;
 const HTTP_CHAT_TIMEOUT_MS: u64 = 3_600_000;
+const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
+const MAX_STREAM_RESPONSE_BYTES: u64 = 128 * 1024 * 1024;
+const STREAM_EVENT_NAME: &str = "kivarro://chat-stream";
 
 #[cfg(target_os = "windows")]
 const WINDOWS_CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -305,6 +308,20 @@ struct InferenceRunResult {
     finish_reason: Option<String>,
 }
 
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct InferenceStreamEvent {
+    request_id: String,
+    phase: String,
+    delta: String,
+    content: String,
+    model: String,
+    completion_tokens: u32,
+    tokens_per_second: f32,
+    elapsed_ms: u128,
+    finish_reason: Option<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ChatTurn {
@@ -316,6 +333,20 @@ struct ChatTurn {
 struct HttpResponse {
     status_code: u16,
     body: Vec<u8>,
+}
+
+#[derive(Debug, Default)]
+struct StreamChunk {
+    delta: String,
+    finish_reason: Option<String>,
+    stop: bool,
+}
+
+#[derive(Debug, Default)]
+struct StreamAccumulator {
+    content: String,
+    completion_tokens: u32,
+    finish_reason: Option<String>,
 }
 
 struct EngineRuntime {
@@ -898,6 +929,198 @@ fn run_chat_completion(
         completion_tokens,
         total_tokens,
         finish_reason,
+    })
+}
+
+#[tauri::command]
+fn run_chat_completion_stream(
+    window: Window,
+    engine: State<'_, EngineRuntime>,
+    request_id: String,
+    model_id: String,
+    profile: InferenceProfile,
+    prompt: String,
+    history: Vec<ChatTurn>,
+) -> Result<InferenceRunResult, String> {
+    validate_profile(&profile)?;
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return Err("prompt is required".to_string());
+    }
+    let request_id = if request_id.trim().is_empty() {
+        format!("stream-{}", unix_timestamp())
+    } else {
+        request_id.trim().to_string()
+    };
+    let requested_model_id = canonical_model_path(&model_id)?
+        .to_string_lossy()
+        .to_string();
+
+    let (host, port, active_model_id, active_model_name) = {
+        let mut guard = engine
+            .inner
+            .lock()
+            .map_err(|_| "engine state lock is poisoned".to_string())?;
+        refresh_engine_process(&mut guard);
+
+        let active_model_id = guard
+            .active_model_id
+            .clone()
+            .ok_or_else(|| "no llama-server model is loaded".to_string())?;
+        if active_model_id != requested_model_id {
+            return Err("selected model is not the active llama-server model".to_string());
+        }
+        if guard.child.is_none() {
+            return Err("llama-server is not running".to_string());
+        }
+
+        (
+            guard.host.clone(),
+            guard.port,
+            active_model_id,
+            guard
+                .active_model_name
+                .clone()
+                .unwrap_or_else(|| "local-model".to_string()),
+        )
+    };
+
+    match probe_llama_health(&host, port, HTTP_HEALTH_TIMEOUT_MS) {
+        HealthProbe::Ready => {}
+        HealthProbe::Loading(message) => {
+            return Err(format!("llama-server is still loading: {message}"));
+        }
+        HealthProbe::Offline(message) => {
+            return Err(format!("llama-server is not reachable: {message}"));
+        }
+    }
+
+    let started = std::time::Instant::now();
+    let mut payload =
+        build_chat_completion_payload(&profile, &active_model_name, prompt, &history)?;
+    payload["stream"] = json!(true);
+
+    emit_stream_event(
+        &window,
+        InferenceStreamEvent {
+            request_id: request_id.clone(),
+            phase: "started".to_string(),
+            delta: String::new(),
+            content: String::new(),
+            model: active_model_name.clone(),
+            completion_tokens: 0,
+            tokens_per_second: 0.0,
+            elapsed_ms: 0,
+            finish_reason: None,
+        },
+    )?;
+
+    let mut accumulator = StreamAccumulator::default();
+    let stream_result = http_sse_request(
+        &host,
+        port,
+        "POST",
+        "/v1/chat/completions",
+        &payload,
+        HTTP_CHAT_TIMEOUT_MS,
+        |value| {
+            let chunk = extract_stream_chunk(&value);
+            if !chunk.delta.is_empty() {
+                accumulator.content.push_str(&chunk.delta);
+                accumulator.completion_tokens = accumulator.completion_tokens.saturating_add(1);
+                let elapsed_ms = started.elapsed().as_millis();
+                let tokens_per_second =
+                    tokens_per_second(accumulator.completion_tokens, elapsed_ms);
+                emit_stream_event(
+                    &window,
+                    InferenceStreamEvent {
+                        request_id: request_id.clone(),
+                        phase: "delta".to_string(),
+                        delta: chunk.delta,
+                        content: accumulator.content.clone(),
+                        model: active_model_name.clone(),
+                        completion_tokens: accumulator.completion_tokens,
+                        tokens_per_second,
+                        elapsed_ms,
+                        finish_reason: None,
+                    },
+                )?;
+            }
+
+            if chunk.finish_reason.is_some() {
+                accumulator.finish_reason = chunk.finish_reason;
+            }
+            Ok(!chunk.stop)
+        },
+    );
+
+    if let Err(err) = stream_result {
+        emit_stream_event(
+            &window,
+            InferenceStreamEvent {
+                request_id,
+                phase: "error".to_string(),
+                delta: String::new(),
+                content: accumulator.content,
+                model: active_model_name,
+                completion_tokens: accumulator.completion_tokens,
+                tokens_per_second: 0.0,
+                elapsed_ms: started.elapsed().as_millis(),
+                finish_reason: Some(err.clone()),
+            },
+        )?;
+        return Err(err);
+    }
+
+    if accumulator.content.is_empty() {
+        return Err("llama-server returned an empty streamed completion".to_string());
+    }
+
+    let elapsed_ms = started.elapsed().as_millis();
+    let completion_tokens = Some(accumulator.completion_tokens);
+    let tokens_per_second = tokens_per_second(accumulator.completion_tokens, elapsed_ms);
+    let total_tokens = completion_tokens;
+
+    {
+        let mut guard = engine
+            .inner
+            .lock()
+            .map_err(|_| "engine state lock is poisoned".to_string())?;
+        guard.last_tokens_per_second = tokens_per_second;
+        guard.context_used_tokens = total_tokens
+            .unwrap_or_default()
+            .min(profile.runtime.context_length);
+        guard.context_total_tokens = profile.runtime.context_length;
+        guard.active_model_id = Some(active_model_id);
+        guard.active_model_name = Some(active_model_name.clone());
+        guard.last_error = None;
+    }
+
+    emit_stream_event(
+        &window,
+        InferenceStreamEvent {
+            request_id: request_id.clone(),
+            phase: "done".to_string(),
+            delta: String::new(),
+            content: accumulator.content.clone(),
+            model: active_model_name.clone(),
+            completion_tokens: accumulator.completion_tokens,
+            tokens_per_second,
+            elapsed_ms,
+            finish_reason: accumulator.finish_reason.clone(),
+        },
+    )?;
+
+    Ok(InferenceRunResult {
+        content: accumulator.content,
+        model: active_model_name,
+        backend: "llama.cpp".to_string(),
+        elapsed_ms,
+        tokens_per_second,
+        prompt_tokens: None,
+        completion_tokens,
+        total_tokens,
+        finish_reason: accumulator.finish_reason,
     })
 }
 
@@ -1856,6 +2079,382 @@ fn json_u32(value: &Value, pointer: &str) -> Option<u32> {
         .and_then(|value| u32::try_from(value).ok())
 }
 
+fn emit_stream_event(window: &Window, payload: InferenceStreamEvent) -> Result<(), String> {
+    window
+        .emit(STREAM_EVENT_NAME, payload)
+        .map_err(|err| format!("failed to emit stream event: {err}"))
+}
+
+fn tokens_per_second(tokens: u32, elapsed_ms: u128) -> f32 {
+    if tokens == 0 || elapsed_ms == 0 {
+        return 0.0;
+    }
+
+    (tokens as f64 / elapsed_ms as f64 * 1000.0) as f32
+}
+
+fn http_sse_request<F>(
+    host: &str,
+    port: u16,
+    method: &str,
+    path: &str,
+    body: &Value,
+    timeout_ms: u64,
+    mut on_value: F,
+) -> Result<(), String>
+where
+    F: FnMut(Value) -> Result<bool, String>,
+{
+    let body_bytes =
+        serde_json::to_vec(body).map_err(|err| format!("failed to encode request JSON: {err}"))?;
+    let address = format!("{host}:{port}")
+        .parse::<SocketAddr>()
+        .map_err(|err| format!("invalid llama-server address {host}:{port}: {err}"))?;
+    let timeout = std::time::Duration::from_millis(timeout_ms);
+    let mut stream = TcpStream::connect_timeout(&address, timeout)
+        .map_err(|err| format!("failed to connect to llama-server at {host}:{port}: {err}"))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|err| format!("failed to set read timeout: {err}"))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|err| format!("failed to set write timeout: {err}"))?;
+
+    let request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: Kivarro/0.1\r\nAccept: text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body_bytes.len()
+    );
+    std::io::Write::write_all(&mut stream, request.as_bytes())
+        .map_err(|err| format!("failed to write HTTP request: {err}"))?;
+    std::io::Write::write_all(&mut stream, &body_bytes)
+        .map_err(|err| format!("failed to write HTTP request body: {err}"))?;
+
+    let (status_code, headers) = read_http_head(&mut stream)?;
+    if status_code >= 400 {
+        let body = read_remaining_http_body(&mut stream, &headers, MAX_HTTP_RESPONSE_BYTES)?;
+        let message = serde_json::from_slice::<Value>(&body)
+            .ok()
+            .and_then(|value| {
+                value
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| String::from_utf8_lossy(&body).trim().to_string());
+        return Err(format!(
+            "llama-server streaming request failed with HTTP {status_code}: {message}"
+        ));
+    }
+
+    let mut sse_buffer = Vec::new();
+    let mut bytes_seen = 0_u64;
+    let mut process_chunk = |chunk: &[u8]| -> Result<bool, String> {
+        bytes_seen = bytes_seen.saturating_add(chunk.len() as u64);
+        if bytes_seen > MAX_STREAM_RESPONSE_BYTES {
+            return Err(format!(
+                "llama-server stream exceeds {} bytes",
+                MAX_STREAM_RESPONSE_BYTES
+            ));
+        }
+
+        process_sse_bytes(&mut sse_buffer, chunk, &mut on_value)
+    };
+
+    if headers
+        .get("transfer-encoding")
+        .map(|value| value.contains("chunked"))
+        .unwrap_or(false)
+    {
+        read_chunked_transfer(&mut stream, MAX_STREAM_RESPONSE_BYTES, &mut process_chunk)?;
+    } else {
+        read_stream_body(&mut stream, MAX_STREAM_RESPONSE_BYTES, &mut process_chunk)?;
+    }
+
+    if !sse_buffer.is_empty() {
+        process_sse_bytes(&mut sse_buffer, b"\n\n", &mut on_value)?;
+    }
+
+    Ok(())
+}
+
+fn read_http_head(stream: &mut TcpStream) -> Result<(u16, HashMap<String, String>), String> {
+    let mut raw = Vec::new();
+    let mut byte = [0_u8; 1];
+    while raw.len() < MAX_HTTP_HEADER_BYTES {
+        let count = stream
+            .read(&mut byte)
+            .map_err(|err| format!("failed to read HTTP response head: {err}"))?;
+        if count == 0 {
+            return Err("connection closed before HTTP response head completed".to_string());
+        }
+        raw.push(byte[0]);
+        if raw.ends_with(b"\r\n\r\n") {
+            return parse_http_head(&raw);
+        }
+    }
+
+    Err(format!(
+        "HTTP response head exceeds {} bytes",
+        MAX_HTTP_HEADER_BYTES
+    ))
+}
+
+fn parse_http_head(raw: &[u8]) -> Result<(u16, HashMap<String, String>), String> {
+    let header_text = String::from_utf8_lossy(raw);
+    let mut lines = header_text.lines();
+    let status_line = lines
+        .next()
+        .ok_or_else(|| "HTTP response did not contain a status line".to_string())?;
+    let status_code = status_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| format!("invalid HTTP status line: {status_line}"))?
+        .parse::<u16>()
+        .map_err(|err| format!("invalid HTTP status code: {err}"))?;
+    let mut headers = HashMap::new();
+    for line in lines {
+        if let Some((key, value)) = line.split_once(':') {
+            headers.insert(
+                key.trim().to_ascii_lowercase(),
+                value.trim().to_ascii_lowercase(),
+            );
+        }
+    }
+
+    Ok((status_code, headers))
+}
+
+fn read_remaining_http_body(
+    stream: &mut TcpStream,
+    headers: &HashMap<String, String>,
+    max_bytes: u64,
+) -> Result<Vec<u8>, String> {
+    let mut body = Vec::new();
+    if headers
+        .get("transfer-encoding")
+        .map(|value| value.contains("chunked"))
+        .unwrap_or(false)
+    {
+        read_chunked_transfer(stream, max_bytes, |chunk| {
+            body.extend_from_slice(chunk);
+            Ok(true)
+        })?;
+    } else {
+        read_stream_body(stream, max_bytes, |chunk| {
+            body.extend_from_slice(chunk);
+            Ok(true)
+        })?;
+    }
+
+    Ok(body)
+}
+
+fn read_stream_body<F>(
+    stream: &mut TcpStream,
+    max_bytes: u64,
+    mut on_chunk: F,
+) -> Result<(), String>
+where
+    F: FnMut(&[u8]) -> Result<bool, String>,
+{
+    let mut bytes_seen = 0_u64;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let count = stream
+            .read(&mut buffer)
+            .map_err(|err| format!("failed to read HTTP response body: {err}"))?;
+        if count == 0 {
+            return Ok(());
+        }
+        bytes_seen = bytes_seen.saturating_add(count as u64);
+        if bytes_seen > max_bytes {
+            return Err(format!("HTTP response body exceeds {max_bytes} bytes"));
+        }
+        if !on_chunk(&buffer[..count])? {
+            return Ok(());
+        }
+    }
+}
+
+fn read_chunked_transfer<F>(
+    stream: &mut TcpStream,
+    max_bytes: u64,
+    mut on_chunk: F,
+) -> Result<(), String>
+where
+    F: FnMut(&[u8]) -> Result<bool, String>,
+{
+    let mut bytes_seen = 0_u64;
+    loop {
+        let Some(size_line) = read_http_line(stream)? else {
+            return Err("chunked response ended before chunk size".to_string());
+        };
+        let size_text = String::from_utf8_lossy(&size_line);
+        let size_hex = size_text.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_hex, 16)
+            .map_err(|err| format!("invalid chunk size {size_hex}: {err}"))?;
+        if size == 0 {
+            consume_trailing_chunk_headers(stream)?;
+            return Ok(());
+        }
+
+        bytes_seen = bytes_seen.saturating_add(size as u64);
+        if bytes_seen > max_bytes {
+            return Err(format!("chunked response exceeds {max_bytes} bytes"));
+        }
+
+        let mut chunk = vec![0_u8; size];
+        stream
+            .read_exact(&mut chunk)
+            .map_err(|err| format!("failed to read chunk data: {err}"))?;
+        let mut crlf = [0_u8; 2];
+        stream
+            .read_exact(&mut crlf)
+            .map_err(|err| format!("failed to read chunk terminator: {err}"))?;
+        if crlf != *b"\r\n" {
+            return Err("chunked response contained an invalid chunk terminator".to_string());
+        }
+
+        if !on_chunk(&chunk)? {
+            return Ok(());
+        }
+    }
+}
+
+fn read_http_line(stream: &mut TcpStream) -> Result<Option<Vec<u8>>, String> {
+    let mut line = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        let count = stream
+            .read(&mut byte)
+            .map_err(|err| format!("failed to read HTTP line: {err}"))?;
+        if count == 0 {
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Err("connection closed in the middle of an HTTP line".to_string())
+            };
+        }
+
+        line.push(byte[0]);
+        if line.len() > MAX_HTTP_HEADER_BYTES {
+            return Err(format!("HTTP line exceeds {} bytes", MAX_HTTP_HEADER_BYTES));
+        }
+        if byte[0] == b'\n' {
+            while matches!(line.last(), Some(b'\r' | b'\n')) {
+                line.pop();
+            }
+            return Ok(Some(line));
+        }
+    }
+}
+
+fn consume_trailing_chunk_headers(stream: &mut TcpStream) -> Result<(), String> {
+    while let Some(line) = read_http_line(stream)? {
+        if line.is_empty() {
+            return Ok(());
+        }
+    }
+
+    Ok(())
+}
+
+fn process_sse_bytes<F>(
+    buffer: &mut Vec<u8>,
+    chunk: &[u8],
+    on_value: &mut F,
+) -> Result<bool, String>
+where
+    F: FnMut(Value) -> Result<bool, String>,
+{
+    buffer.extend_from_slice(chunk);
+    while let Some((boundary_start, boundary_len)) = find_sse_boundary(buffer) {
+        let frame = buffer[..boundary_start].to_vec();
+        buffer.drain(..boundary_start + boundary_len);
+        if !process_sse_frame(&frame, on_value)? {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+fn find_sse_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
+    let lf = buffer
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|position| (position, 2));
+    let crlf = buffer
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|position| (position, 4));
+
+    match (lf, crlf) {
+        (Some(left), Some(right)) => Some(if left.0 <= right.0 { left } else { right }),
+        (Some(boundary), None) | (None, Some(boundary)) => Some(boundary),
+        (None, None) => None,
+    }
+}
+
+fn process_sse_frame<F>(frame: &[u8], on_value: &mut F) -> Result<bool, String>
+where
+    F: FnMut(Value) -> Result<bool, String>,
+{
+    let text = String::from_utf8_lossy(frame);
+    let data = text
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim_end_matches('\r');
+            line.strip_prefix("data:")
+                .map(|value| value.trim_start().to_string())
+        })
+        .collect::<Vec<_>>();
+    if data.is_empty() {
+        return Ok(true);
+    }
+
+    let payload = data.join("\n");
+    if payload.trim() == "[DONE]" {
+        return Ok(false);
+    }
+
+    let value = serde_json::from_str::<Value>(&payload)
+        .map_err(|err| format!("failed to parse SSE JSON payload: {err}; payload: {payload}"))?;
+    on_value(value)
+}
+
+fn extract_stream_chunk(value: &Value) -> StreamChunk {
+    let delta = value
+        .pointer("/choices/0/delta/content")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            value
+                .pointer("/choices/0/message/content")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| value.pointer("/choices/0/text").and_then(Value::as_str))
+        .or_else(|| value.pointer("/content").and_then(Value::as_str))
+        .unwrap_or_default()
+        .to_string();
+    let finish_reason = value
+        .pointer("/choices/0/finish_reason")
+        .and_then(Value::as_str)
+        .or_else(|| value.pointer("/stop_type").and_then(Value::as_str))
+        .filter(|reason| !reason.is_empty() && *reason != "none")
+        .map(str::to_string);
+    let stop = value
+        .pointer("/stop")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || finish_reason.is_some();
+
+    StreamChunk {
+        delta,
+        finish_reason,
+        stop,
+    }
+}
+
 fn read_model_gguf_metadata(path: &Path) -> Option<GgufMetadataSummary> {
     if !is_gguf_file(path) {
         return None;
@@ -2500,6 +3099,55 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "--mlock"));
     }
 
+    #[test]
+    fn parses_split_openai_sse_chat_deltas() {
+        let mut buffer = Vec::new();
+        let mut deltas = Vec::new();
+        let mut keep_going = process_sse_bytes(
+            &mut buffer,
+            br#"data: {"choices":[{"delta":{"content":"hel"},"finish_reason":null}]}"#,
+            &mut |value| {
+                deltas.push(extract_stream_chunk(&value));
+                Ok(true)
+            },
+        )
+        .expect("first split SSE chunk");
+        assert!(keep_going);
+        assert!(deltas.is_empty());
+
+        keep_going = process_sse_bytes(
+            &mut buffer,
+            b"\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"lo\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+            &mut |value| {
+                deltas.push(extract_stream_chunk(&value));
+                Ok(true)
+            },
+        )
+        .expect("second split SSE chunk");
+
+        assert!(!keep_going);
+        assert_eq!(deltas.len(), 2);
+        assert_eq!(deltas[0].delta, "hel");
+        assert!(!deltas[0].stop);
+        assert_eq!(deltas[1].delta, "lo");
+        assert_eq!(deltas[1].finish_reason.as_deref(), Some("stop"));
+        assert!(deltas[1].stop);
+    }
+
+    #[test]
+    fn extracts_llama_completion_stream_content() {
+        let value = json!({
+            "content": " token",
+            "tokens": [123],
+            "stop": false
+        });
+        let chunk = extract_stream_chunk(&value);
+
+        assert_eq!(chunk.delta, " token");
+        assert!(!chunk.stop);
+        assert!(chunk.finish_reason.is_none());
+    }
+
     fn push_gguf_string_kv(bytes: &mut Vec<u8>, key: &str, value: &str) {
         push_gguf_string(bytes, key);
         bytes.extend_from_slice(&GGUF_VALUE_TYPE_STRING.to_le_bytes());
@@ -2549,6 +3197,7 @@ pub fn run() {
             start_llama_server,
             stop_llama_server,
             run_chat_completion,
+            run_chat_completion_stream,
             get_api_status,
             list_benchmark_results,
             list_system_logs

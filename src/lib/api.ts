@@ -389,6 +389,30 @@ export function runChatCompletion(
   );
 }
 
+export function runChatCompletionStream(
+  requestId: string,
+  modelId: string,
+  profile: InferenceProfile,
+  prompt: string,
+  history: ChatTurn[],
+): Promise<InferenceRunResult> {
+  return invokeOrPreview(
+    "run_chat_completion_stream",
+    {
+      content: "Preview mode cannot stream from a local inference engine. Open Kivarro in Tauri to run this prompt.",
+      model: "preview",
+      backend: "preview",
+      elapsedMs: 0,
+      tokensPerSecond: 0,
+      promptTokens: null,
+      completionTokens: null,
+      totalTokens: null,
+      finishReason: "preview",
+    },
+    { requestId, modelId, profile, prompt, history },
+  );
+}
+
 export function listBenchmarkResults(): Promise<BenchmarkResult[]> {
   return safeInvoke("list_benchmark_results", []);
 }

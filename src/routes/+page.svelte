@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { listen } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import {
     Activity,
@@ -49,7 +50,7 @@
     listInferenceProfiles,
     listModels,
     listSystemLogs,
-    runChatCompletion,
+    runChatCompletionStream,
     saveInferenceProfile,
     startLlamaServer,
     stopLlamaServer,
@@ -62,6 +63,7 @@
     HardwareSnapshot,
     InferenceProfile,
     InferenceRunResult,
+    InferenceStreamEvent,
     LogEntry,
     ModelRecord,
     ModelLoadPlan,
@@ -82,6 +84,7 @@
     content: string;
     tokens?: number;
     speed?: number;
+    streaming?: boolean;
   };
 
   const navItems: NavItem[] = [
@@ -194,6 +197,20 @@
 
   onMount(() => {
     void hydrate();
+    let streamUnlisten: (() => void) | null = null;
+    let disposed = false;
+    if (isTauriRuntime()) {
+      void listen<InferenceStreamEvent>("kivarro://chat-stream", (event) => {
+        handleStreamEvent(event.payload);
+      }).then((unlisten) => {
+        if (disposed) {
+          unlisten();
+        } else {
+          streamUnlisten = unlisten;
+        }
+      });
+    }
+
     const refreshTimer = window.setInterval(() => void refreshRuntime(), 4000);
     const keyHandler = (event: KeyboardEvent) => {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
@@ -205,6 +222,8 @@
     window.addEventListener("keydown", keyHandler);
 
     return () => {
+      disposed = true;
+      streamUnlisten?.();
       window.clearInterval(refreshTimer);
       window.removeEventListener("keydown", keyHandler);
     };
@@ -349,9 +368,15 @@
       addSystemMessage("Engine", "Select and load a model before sending a prompt.");
       return;
     }
+    const requestId = createId("assistant");
 
     const history = chatMessages
-      .filter((message) => message.role === "user" || message.role === "assistant")
+      .filter(
+        (message) =>
+          (message.role === "user" || message.role === "assistant") &&
+          message.id !== "assistant-preview" &&
+          message.content.trim().length > 0,
+      )
       .slice(-12)
       .map((message): ChatTurn => ({ role: message.role, content: message.content }));
 
@@ -363,18 +388,28 @@
         label: "You",
         content: prompt,
       },
+      {
+        id: requestId,
+        role: "assistant",
+        label: selectedModel?.name ?? "Kivarro",
+        content: "",
+        tokens: 0,
+        speed: 0,
+        streaming: true,
+      },
     ];
     promptText = "";
     promptBusy = true;
 
     try {
-      const result = await runChatCompletion(
+      const result = await runChatCompletionStream(
+        requestId,
         selectedModelId,
         buildProfileFromControls(),
         prompt,
         history,
       );
-      appendAssistantResult(result);
+      finalizeAssistantResult(requestId, result);
       const [nextMetrics, nextEngineStatus, nextApiStatus] = await Promise.all([
         getRuntimeMetrics(),
         getEngineStatus(),
@@ -384,7 +419,7 @@
       engineStatus = nextEngineStatus;
       apiStatus = nextApiStatus;
     } catch (error) {
-      addSystemMessage("Engine", errorMessage(error));
+      markAssistantError(requestId, errorMessage(error));
     } finally {
       promptBusy = false;
     }
@@ -403,11 +438,15 @@
   }
 
   function getTauriWindow() {
-    if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) {
+    if (!isTauriRuntime()) {
       return null;
     }
 
     return getCurrentWindow();
+  }
+
+  function isTauriRuntime() {
+    return typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
   }
 
   function clamp(value: number, min: number, max: number) {
@@ -457,18 +496,47 @@
     ];
   }
 
-  function appendAssistantResult(result: InferenceRunResult) {
-    chatMessages = [
-      ...chatMessages,
-      {
-        id: createId("assistant"),
-        role: "assistant",
+  function handleStreamEvent(event: InferenceStreamEvent) {
+    chatMessages = chatMessages.map((message) => {
+      if (message.id !== event.requestId) return message;
+
+      return {
+        ...message,
+        label: event.model || message.label,
+        content: event.content || message.content,
+        tokens: event.completionTokens || message.tokens,
+        speed: event.tokensPerSecond || message.speed,
+        streaming: event.phase !== "done" && event.phase !== "error",
+      };
+    });
+  }
+
+  function finalizeAssistantResult(messageId: string, result: InferenceRunResult) {
+    chatMessages = chatMessages.map((message) => {
+      if (message.id !== messageId) return message;
+
+      return {
+        ...message,
         label: result.model,
-        content: result.content,
-        tokens: result.completionTokens ?? undefined,
+        content: result.content || message.content,
+        tokens: result.completionTokens ?? message.tokens,
         speed: result.tokensPerSecond,
-      },
-    ];
+        streaming: false,
+      };
+    });
+  }
+
+  function markAssistantError(messageId: string, content: string) {
+    chatMessages = chatMessages.map((message) => {
+      if (message.id !== messageId) return message;
+
+      return {
+        ...message,
+        label: "Engine",
+        content,
+        streaming: false,
+      };
+    });
   }
 
   function controlsFromProfile(profile: InferenceProfile) {
@@ -734,14 +802,19 @@
             </div>
             <div class="message-list">
               {#each chatMessages as message}
-                <article class:system={message.role === "system"} class="message">
+                <article class:system={message.role === "system"} class:streaming={message.streaming} class="message">
                   <div class="message-meta">
                     <span>{message.label}</span>
                     {#if message.tokens}
                       <code>{message.tokens} tokens</code>
                     {/if}
                   </div>
-                  <p>{message.content}<span class="stream-cursor"></span></p>
+                  <p>
+                    {message.content || (message.streaming ? "receiving tokens..." : "")}
+                    {#if message.streaming}
+                      <span class="stream-cursor"></span>
+                    {/if}
+                  </p>
                 </article>
               {/each}
             </div>
@@ -1957,6 +2030,10 @@
 
   .message.system {
     color: var(--muted);
+  }
+
+  .message.streaming {
+    color: var(--text);
   }
 
   .message-meta {
