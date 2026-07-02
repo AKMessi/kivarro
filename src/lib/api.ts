@@ -421,6 +421,13 @@ export function listBenchmarkResults(): Promise<BenchmarkResult[]> {
   return safeInvoke("list_benchmark_results", []);
 }
 
+export function runBenchmark(
+  modelId: string,
+  profile: InferenceProfile,
+): Promise<BenchmarkResult[]> {
+  return invokeOrPreview("run_benchmark", [], { modelId, profile });
+}
+
 export function listSystemLogs(): Promise<LogEntry[]> {
   return safeInvoke("list_system_logs", [
     {

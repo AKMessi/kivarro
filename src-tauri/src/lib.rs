@@ -21,6 +21,8 @@ use tauri::{AppHandle, Emitter, Manager, State, Window};
 use std::os::windows::process::CommandExt;
 
 const PROFILE_EXTENSION: &str = "kivarro.json";
+const BENCHMARK_RESULTS_FILE: &str = "benchmarks.json";
+const MAX_BENCHMARK_RESULTS: usize = 200;
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 const GGUF_VALUE_TYPE_ARRAY: u32 = 9;
 const GGUF_VALUE_TYPE_STRING: u32 = 8;
@@ -261,7 +263,7 @@ struct ApiStatus {
     endpoints: Vec<ApiEndpoint>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct BenchmarkResult {
     model: String,
@@ -376,6 +378,8 @@ struct ManagedEngine {
     active_model_id: Option<String>,
     active_model_name: Option<String>,
     active_request_model: Option<String>,
+    load_started_at: Option<Instant>,
+    last_load_duration_ms: u64,
     host: String,
     port: u16,
     last_error: Option<String>,
@@ -401,6 +405,8 @@ impl Default for ManagedEngine {
             active_model_id: None,
             active_model_name: None,
             active_request_model: None,
+            load_started_at: None,
+            last_load_duration_ms: 0,
             host: DEFAULT_API_HOST.to_string(),
             port: configured_api_port(),
             last_error: None,
@@ -1162,10 +1168,12 @@ fn start_engine_for_backend(
     guard.active_model_id = Some(canonical_model_id);
     guard.active_model_name = Some(model_name);
     guard.active_request_model = Some(request_model);
+    guard.load_started_at = Some(Instant::now());
     guard.host = host;
     guard.port = port;
     guard.last_error = None;
     guard.last_tokens_per_second = 0.0;
+    guard.last_load_duration_ms = 0;
     guard.context_used_tokens = 0;
     guard.context_total_tokens = profile.runtime.context_length;
 
@@ -1183,6 +1191,8 @@ fn stop_inference_engine(engine: State<'_, EngineRuntime>) -> Result<EngineStatu
     guard.active_model_id = None;
     guard.active_model_name = None;
     guard.active_request_model = None;
+    guard.load_started_at = None;
+    guard.last_load_duration_ms = 0;
     guard.last_error = None;
     guard.last_tokens_per_second = 0.0;
     guard.context_used_tokens = 0;
@@ -1224,6 +1234,16 @@ fn cancel_chat_completion_stream(
 #[tauri::command]
 fn run_chat_completion(
     engine: State<'_, EngineRuntime>,
+    model_id: String,
+    profile: InferenceProfile,
+    prompt: String,
+    history: Vec<ChatTurn>,
+) -> Result<InferenceRunResult, String> {
+    run_chat_completion_inner(&engine, model_id, profile, prompt, history)
+}
+
+fn run_chat_completion_inner(
+    engine: &State<'_, EngineRuntime>,
     model_id: String,
     profile: InferenceProfile,
     prompt: String,
@@ -1576,8 +1596,61 @@ fn get_api_status(engine: State<'_, EngineRuntime>) -> Result<ApiStatus, String>
 }
 
 #[tauri::command]
-fn list_benchmark_results() -> Result<Vec<BenchmarkResult>, String> {
-    Ok(Vec::new())
+fn list_benchmark_results(app_handle: AppHandle) -> Result<Vec<BenchmarkResult>, String> {
+    read_benchmark_results(&app_handle)
+}
+
+#[tauri::command]
+fn run_benchmark(
+    app_handle: AppHandle,
+    engine: State<'_, EngineRuntime>,
+    model_id: String,
+    profile: InferenceProfile,
+) -> Result<Vec<BenchmarkResult>, String> {
+    let mut benchmark_profile = profile;
+    benchmark_profile.sampling.temperature = 0.0;
+    benchmark_profile.sampling.seed = Some(42);
+    benchmark_profile.sampling.max_tokens = 128;
+    benchmark_profile.sampling.stop_sequences.clear();
+    benchmark_profile.output.mode = "text".to_string();
+    benchmark_profile.output.json_schema.clear();
+    benchmark_profile.output.grammar.clear();
+    benchmark_profile.output.logprobs = false;
+    benchmark_profile.output.top_logprobs = 0;
+
+    let completion = run_chat_completion_inner(
+        &engine,
+        model_id,
+        benchmark_profile,
+        benchmark_prompt().to_string(),
+        Vec::new(),
+    )?;
+    let elapsed_ms = u64::try_from(completion.elapsed_ms).unwrap_or(u64::MAX);
+    let eval_count = completion
+        .completion_tokens
+        .unwrap_or_else(|| estimate_token_count(&completion.content));
+    let tokens_per_second = if completion.tokens_per_second > 0.0 {
+        completion.tokens_per_second
+    } else {
+        tokens_per_second(eval_count, completion.elapsed_ms)
+    };
+    let load_duration_ms = current_load_duration_ms(&engine)?;
+    let mut results = read_benchmark_results(&app_handle)?;
+    results.insert(
+        0,
+        BenchmarkResult {
+            model: completion.model,
+            backend: completion.backend,
+            eval_count,
+            eval_duration_ms: elapsed_ms,
+            tokens_per_second,
+            load_duration_ms,
+        },
+    );
+    results.truncate(MAX_BENCHMARK_RESULTS);
+    write_benchmark_results(&app_handle, &results)?;
+
+    Ok(results)
 }
 
 #[tauri::command]
@@ -1611,6 +1684,79 @@ fn profile_directory(app_handle: &AppHandle) -> Result<PathBuf, String> {
         .app_config_dir()
         .map(|path| path.join("profiles"))
         .map_err(|err| format!("failed to resolve app profile directory: {err}"))
+}
+
+fn benchmark_results_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
+    app_handle
+        .path()
+        .app_config_dir()
+        .map(|path| path.join(BENCHMARK_RESULTS_FILE))
+        .map_err(|err| format!("failed to resolve benchmark results path: {err}"))
+}
+
+fn read_benchmark_results(app_handle: &AppHandle) -> Result<Vec<BenchmarkResult>, String> {
+    let path = benchmark_results_path(app_handle)?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let raw = fs::read_to_string(&path)
+        .map_err(|err| format!("failed to read benchmark results {}: {err}", path.display()))?;
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut results = serde_json::from_str::<Vec<BenchmarkResult>>(&raw).map_err(|err| {
+        format!(
+            "failed to parse benchmark results {}: {err}",
+            path.display()
+        )
+    })?;
+    results.truncate(MAX_BENCHMARK_RESULTS);
+
+    Ok(results)
+}
+
+fn write_benchmark_results(
+    app_handle: &AppHandle,
+    results: &[BenchmarkResult],
+) -> Result<(), String> {
+    let path = benchmark_results_path(app_handle)?;
+    let Some(directory) = path.parent() else {
+        return Err("benchmark results path has no parent directory".to_string());
+    };
+    fs::create_dir_all(directory).map_err(|err| {
+        format!(
+            "failed to create benchmark directory {}: {err}",
+            directory.display()
+        )
+    })?;
+    let encoded = serde_json::to_string_pretty(results)
+        .map_err(|err| format!("failed to encode benchmark results: {err}"))?;
+    fs::write(&path, encoded).map_err(|err| {
+        format!(
+            "failed to write benchmark results {}: {err}",
+            path.display()
+        )
+    })
+}
+
+fn benchmark_prompt() -> &'static str {
+    "Benchmark local inference throughput. Write one dense technical paragraph about memory bandwidth, context windows, GPU offload, and token sampling. Continue until the response is complete."
+}
+
+fn current_load_duration_ms(engine: &State<'_, EngineRuntime>) -> Result<u64, String> {
+    let guard = engine
+        .inner
+        .lock()
+        .map_err(|_| "engine state lock is poisoned".to_string())?;
+
+    Ok(guard.last_load_duration_ms)
+}
+
+fn estimate_token_count(content: &str) -> u32 {
+    let words = content.split_whitespace().count();
+    u32::try_from(words.max(1)).unwrap_or(u32::MAX)
 }
 
 fn seed_default_profiles(directory: &Path) -> Result<(), String> {
@@ -2053,11 +2199,16 @@ fn engine_status_from_guard(
     let process_label = engine_process_label(&backend);
     let (state, message, health_ok) = if guard.child.is_some() {
         match probe_engine_health(&guard.host, guard.port, HTTP_HEALTH_TIMEOUT_MS) {
-            HealthProbe::Ready => (
-                "ready".to_string(),
-                format!("{process_label} is ready for local chat completions"),
-                true,
-            ),
+            HealthProbe::Ready => {
+                if let Some(started_at) = guard.load_started_at.take() {
+                    guard.last_load_duration_ms = started_at.elapsed().as_millis() as u64;
+                }
+                (
+                    "ready".to_string(),
+                    format!("{process_label} is ready for local chat completions"),
+                    true,
+                )
+            }
             HealthProbe::Loading(message) => ("loading".to_string(), message, false),
             HealthProbe::Offline(message) => ("loading".to_string(), message, false),
         }
@@ -2104,6 +2255,7 @@ fn refresh_engine_process(guard: &mut ManagedEngine) {
     match child.try_wait() {
         Ok(Some(status)) => {
             guard.child = None;
+            guard.load_started_at = None;
             guard.last_error = Some(format!(
                 "{} exited with status {status}",
                 engine_process_label(&guard.active_backend)
@@ -2112,6 +2264,7 @@ fn refresh_engine_process(guard: &mut ManagedEngine) {
         Ok(None) => {}
         Err(err) => {
             guard.child = None;
+            guard.load_started_at = None;
             guard.last_error = Some(format!(
                 "failed to inspect {} process: {err}",
                 engine_process_label(&guard.active_backend)
@@ -3999,6 +4152,7 @@ pub fn run() {
             run_chat_completion,
             run_chat_completion_stream,
             get_api_status,
+            run_benchmark,
             list_benchmark_results,
             list_system_logs
         ])

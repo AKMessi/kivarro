@@ -51,6 +51,7 @@
     listInferenceProfiles,
     listModels,
     listSystemLogs,
+    runBenchmark,
     runChatCompletionStream,
     saveInferenceProfile,
     startInferenceEngine,
@@ -129,6 +130,7 @@
   let engineBusy = false;
   let engineNotice = "";
   let promptBusy = false;
+  let benchmarkBusy = false;
   let generationCancelling = false;
   let currentStreamRequestId = "";
 
@@ -362,6 +364,33 @@
       addSystemMessage("Engine", engineNotice);
     } finally {
       engineBusy = false;
+    }
+  }
+
+  async function runModelBenchmark() {
+    if (!selectedModelId || !selectedModel) {
+      addSystemMessage("Benchmark", "Select and load a model before running a benchmark.");
+      activeView = "models";
+      return;
+    }
+    if (!engineOnline) {
+      addSystemMessage("Benchmark", "Load the selected model before running a benchmark.");
+      return;
+    }
+
+    benchmarkBusy = true;
+    try {
+      benchmarks = await runBenchmark(selectedModelId, buildProfileFromControls());
+      const [nextMetrics, nextEngineStatus] = await Promise.all([
+        getRuntimeMetrics(),
+        getEngineStatus(),
+      ]);
+      metrics = nextMetrics;
+      engineStatus = nextEngineStatus;
+    } catch (error) {
+      addSystemMessage("Benchmark", errorMessage(error));
+    } finally {
+      benchmarkBusy = false;
     }
   }
 
@@ -1354,9 +1383,9 @@
             <p class="eyebrow">Benchmarks</p>
             <h1>Throughput and load profile</h1>
           </div>
-          <button class="primary-button">
+          <button class="primary-button" disabled={benchmarkBusy || !engineOnline} onclick={runModelBenchmark}>
             <Gauge size={15} />
-            Run benchmark
+            {benchmarkBusy ? "Benchmarking" : "Run benchmark"}
           </button>
         </section>
 
@@ -1372,7 +1401,9 @@
               <div>
                 <span>{result.model}</span>
                 <i style={`width: ${Math.min(result.tokensPerSecond, 160)}%`}></i>
-                <code>{formatNumber(result.tokensPerSecond)} tok/s</code>
+                <code>
+                  {formatNumber(result.tokensPerSecond)} tok/s · {formatTokens(result.evalCount)} eval · {formatNumber(result.evalDurationMs / 1000)}s
+                </code>
               </div>
             {/each}
           </section>
