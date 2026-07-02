@@ -7,10 +7,10 @@ Kivarro is a Rust/Tauri local model inference workstation for Windows, macOS, an
 - Tauri v2 desktop app with SvelteKit and TypeScript.
 - Custom Kivarro application shell with nav rail, contextual panel, workspace, inspector, and status bar.
 - Implemented views for Command Center, Model Registry, Hardware Fit, Expert Tuning, RAG Knowledge Bases, Agents, Local API, Benchmarks, Logs, and Settings.
-- Rust commands for CPU/RAM telemetry, local model discovery under `./models`, API endpoint metadata, logs, and benchmark result surfaces.
+- Rust commands for CPU/RAM telemetry, local model discovery under `./models`, GGUF metadata indexing, API endpoint metadata, logs, and benchmark result surfaces.
 - Persistent `.kivarro.json` inference profiles stored in the app config directory.
 - Profile-backed tuning controls for sampling, runtime, KV cache precision, context length, batching, mmap/mlock, and Flash Attention.
-- Model load-plan estimator for RAM pressure, KV cache allocation, runtime overhead, and GPU/CPU layer split.
+- Model load-plan estimator for RAM pressure, KV cache allocation, runtime overhead, and GPU/CPU layer split, using GGUF layer/context metadata when available.
 - Browser-preview fallbacks for UI smoke testing outside Tauri.
 - Windows ARM64 release bundling verified with MSI and NSIS outputs.
 
@@ -40,7 +40,7 @@ npm run preview -- --host 127.0.0.1 --port 4173
 
 ## Model files
 
-Place local model files under `./models`. The baseline scanner currently recognizes `.gguf`, `.safetensors`, `.bin`, and `.mlx` files.
+Place local model files under `./models`. The scanner recognizes `.gguf`, `.safetensors`, `.bin`, and `.mlx` files. GGUF files are indexed directly from the file header and metadata block for architecture, quantization, tensor count, context length, and transformer block count without loading tensor payloads.
 
 ## Profiles
 
@@ -58,6 +58,5 @@ Profiles are saved as `.kivarro.json` files through the Tauri backend. The profi
 - Engine adapter layer for `llama.cpp` and `mistral.rs`.
 - Real GPU/accelerator discovery and VRAM telemetry.
 - OpenAI-compatible local server implementation.
-- Profile persistence for `.kivarro.json`.
 - RAG ingestion, vector indexing, retrieval testing, and citations.
 - Benchmark runner with CSV export.

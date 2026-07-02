@@ -61,6 +61,14 @@ export interface ModelRecord {
   sizeGib: number;
   status: string;
   fit: string;
+  architecture?: string | null;
+  parameterSize?: string | null;
+  quantization?: string | null;
+  contextLength?: number | null;
+  blockCount?: number | null;
+  tensorCount?: number | null;
+  ggufVersion?: number | null;
+  metadataSource: string;
 }
 
 export interface SamplingParameters {
@@ -136,6 +144,12 @@ export interface ModelLoadPlan {
   backend: string;
   fit: string;
   recommendation: string;
+  modelName: string;
+  architecture?: string | null;
+  parameterSize?: string | null;
+  quantization?: string | null;
+  modelContextLength?: number | null;
+  metadataSource: string;
   estimatedLayers: number;
   gpuLayers: number;
   cpuLayers: number;

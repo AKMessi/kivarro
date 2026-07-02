@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     env, fs,
+    fs::File,
+    io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -8,6 +11,14 @@ use sysinfo::System;
 use tauri::{AppHandle, Manager};
 
 const PROFILE_EXTENSION: &str = "kivarro.json";
+const GGUF_MAGIC: &[u8; 4] = b"GGUF";
+const GGUF_VALUE_TYPE_ARRAY: u32 = 9;
+const GGUF_VALUE_TYPE_STRING: u32 = 8;
+const MAX_GGUF_METADATA_PAIRS: u64 = 50_000;
+const MAX_GGUF_KEY_BYTES: u64 = 65_535;
+const MAX_GGUF_STRING_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_GGUF_ARRAY_ITEMS: u64 = 2_000_000;
+const MAX_GGUF_ARRAY_DEPTH: u8 = 4;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -70,6 +81,14 @@ struct ModelRecord {
     size_gib: f64,
     status: String,
     fit: String,
+    architecture: Option<String>,
+    parameter_size: Option<String>,
+    quantization: Option<String>,
+    context_length: Option<u32>,
+    block_count: Option<u16>,
+    tensor_count: Option<u64>,
+    gguf_version: Option<u32>,
+    metadata_source: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -159,6 +178,12 @@ struct ModelLoadPlan {
     backend: String,
     fit: String,
     recommendation: String,
+    model_name: String,
+    architecture: Option<String>,
+    parameter_size: Option<String>,
+    quantization: Option<String>,
+    model_context_length: Option<u32>,
+    metadata_source: String,
     estimated_layers: u16,
     gpu_layers: u16,
     cpu_layers: u16,
@@ -169,6 +194,26 @@ struct ModelLoadPlan {
     ram_total_gib: f64,
     ram_available_gib: f64,
     segments: Vec<LoadPlanSegment>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct GgufMetadataSummary {
+    version: u32,
+    tensor_count: u64,
+    name: Option<String>,
+    basename: Option<String>,
+    architecture: Option<String>,
+    parameter_size: Option<String>,
+    quantization: Option<String>,
+    context_length: Option<u32>,
+    block_count: Option<u16>,
+}
+
+#[derive(Debug, Clone)]
+enum GgufScalarValue {
+    String(String),
+    Unsigned(u64),
+    Signed(i64),
 }
 
 #[derive(Debug, Serialize)]
@@ -416,11 +461,36 @@ fn get_model_load_plan(
         )
     })?;
     let model_weights_gib = bytes_to_gib(metadata.len());
-    let model_name = model_path
+    let fallback_model_name = model_path
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or("model");
-    let estimated_layers = estimate_layer_count(model_name);
+    let gguf_metadata = read_model_gguf_metadata(&model_path);
+    let model_name = gguf_metadata
+        .as_ref()
+        .map(|summary| gguf_display_name(summary, fallback_model_name))
+        .unwrap_or_else(|| fallback_model_name.to_string());
+    let architecture = gguf_metadata
+        .as_ref()
+        .and_then(|summary| summary.architecture.clone());
+    let parameter_size = gguf_metadata
+        .as_ref()
+        .and_then(|summary| summary.parameter_size.clone());
+    let quantization = gguf_metadata
+        .as_ref()
+        .and_then(|summary| summary.quantization.clone())
+        .or_else(|| infer_quantization_from_name(fallback_model_name));
+    let model_context_length = gguf_metadata
+        .as_ref()
+        .and_then(|summary| summary.context_length);
+    let block_count = gguf_metadata
+        .as_ref()
+        .and_then(|summary| summary.block_count);
+    let metadata_source = gguf_metadata
+        .as_ref()
+        .map(|summary| format!("GGUF v{}", summary.version))
+        .unwrap_or_else(|| "filename".to_string());
+    let estimated_layers = estimate_layer_count(&model_name, block_count);
     let gpu_layers = profile.runtime.gpu_layers.min(estimated_layers);
     let cpu_layers = estimated_layers.saturating_sub(gpu_layers);
     let kv_cache_gib = estimate_kv_cache_gib(
@@ -445,7 +515,14 @@ fn get_model_load_plan(
     }
     .to_string();
 
-    let recommendation = if fit == "Fits available RAM" && gpu_layers == estimated_layers {
+    let recommendation = if let Some(model_context_length) = model_context_length
+        .filter(|context_length| profile.runtime.context_length > *context_length)
+    {
+        format!(
+            "Requested {} token context exceeds GGUF context {}; reduce context length or verify RoPE scaling before loading.",
+            profile.runtime.context_length, model_context_length
+        )
+    } else if fit == "Fits available RAM" && gpu_layers == estimated_layers {
         "All estimated layers can stay on the selected accelerator profile.".to_string()
     } else if fit == "Fits available RAM" {
         format!("{cpu_layers} estimated layers remain on CPU; increase GPU layers if VRAM allows.")
@@ -462,6 +539,12 @@ fn get_model_load_plan(
         backend: profile.runtime.backend,
         fit,
         recommendation,
+        model_name,
+        architecture,
+        parameter_size,
+        quantization,
+        model_context_length,
+        metadata_source,
         estimated_layers,
         gpu_layers,
         cpu_layers,
@@ -889,7 +972,373 @@ fn unix_timestamp() -> u64 {
         .unwrap_or_default()
 }
 
-fn estimate_layer_count(model_name: &str) -> u16 {
+fn read_model_gguf_metadata(path: &Path) -> Option<GgufMetadataSummary> {
+    if !is_gguf_file(path) {
+        return None;
+    }
+
+    read_gguf_metadata_summary(path).ok().flatten()
+}
+
+fn read_gguf_metadata_summary(path: &Path) -> Result<Option<GgufMetadataSummary>, String> {
+    let mut reader = GgufReader::open(path)?;
+    let magic = reader.read_bytes::<4>()?;
+    if &magic != GGUF_MAGIC {
+        return Ok(None);
+    }
+
+    let version = reader.read_u32()?;
+    let tensor_count = reader.read_u64()?;
+    let metadata_kv_count = reader.read_u64()?;
+    if metadata_kv_count > MAX_GGUF_METADATA_PAIRS {
+        return Err(format!(
+            "GGUF metadata count {} exceeds safety limit {}",
+            metadata_kv_count, MAX_GGUF_METADATA_PAIRS
+        ));
+    }
+
+    let mut values = HashMap::new();
+    for _ in 0..metadata_kv_count {
+        let key = reader.read_string(MAX_GGUF_KEY_BYTES, "metadata key")?;
+        let value_type = reader.read_u32()?;
+        let value = read_gguf_scalar_value(&mut reader, value_type)?;
+
+        if let Some(value) = value {
+            if should_retain_gguf_key(&key) {
+                values.insert(key, value);
+            }
+        }
+    }
+
+    Ok(Some(build_gguf_metadata_summary(
+        version,
+        tensor_count,
+        values,
+    )))
+}
+
+fn should_retain_gguf_key(key: &str) -> bool {
+    key.starts_with("general.")
+        || key.ends_with(".context_length")
+        || key.ends_with(".block_count")
+        || key.ends_with(".embedding_length")
+}
+
+fn build_gguf_metadata_summary(
+    version: u32,
+    tensor_count: u64,
+    values: HashMap<String, GgufScalarValue>,
+) -> GgufMetadataSummary {
+    let architecture = gguf_string(&values, "general.architecture");
+    let context_length = architecture
+        .as_deref()
+        .and_then(|architecture| gguf_u32(&values, &format!("{architecture}.context_length")))
+        .or_else(|| first_gguf_u32_by_suffix(&values, ".context_length"));
+    let block_count = architecture
+        .as_deref()
+        .and_then(|architecture| gguf_u16(&values, &format!("{architecture}.block_count")))
+        .or_else(|| first_gguf_u16_by_suffix(&values, ".block_count"));
+    let quantization = gguf_u64(&values, "general.file_type").map(gguf_file_type_label);
+
+    GgufMetadataSummary {
+        version,
+        tensor_count,
+        name: gguf_string(&values, "general.name"),
+        basename: gguf_string(&values, "general.basename"),
+        architecture,
+        parameter_size: gguf_string(&values, "general.size_label"),
+        quantization,
+        context_length,
+        block_count,
+    }
+}
+
+struct GgufReader {
+    file: File,
+}
+
+impl GgufReader {
+    fn open(path: &Path) -> Result<Self, String> {
+        File::open(path)
+            .map(|file| Self { file })
+            .map_err(|err| format!("failed to open GGUF metadata {}: {err}", path.display()))
+    }
+
+    fn read_bytes<const N: usize>(&mut self) -> Result<[u8; N], String> {
+        let mut bytes = [0; N];
+        self.file
+            .read_exact(&mut bytes)
+            .map_err(|err| format!("failed to read GGUF metadata: {err}"))?;
+        Ok(bytes)
+    }
+
+    fn read_u8(&mut self) -> Result<u8, String> {
+        Ok(self.read_bytes::<1>()?[0])
+    }
+
+    fn read_i8(&mut self) -> Result<i8, String> {
+        Ok(i8::from_le_bytes(self.read_bytes::<1>()?))
+    }
+
+    fn read_u16(&mut self) -> Result<u16, String> {
+        Ok(u16::from_le_bytes(self.read_bytes::<2>()?))
+    }
+
+    fn read_i16(&mut self) -> Result<i16, String> {
+        Ok(i16::from_le_bytes(self.read_bytes::<2>()?))
+    }
+
+    fn read_u32(&mut self) -> Result<u32, String> {
+        Ok(u32::from_le_bytes(self.read_bytes::<4>()?))
+    }
+
+    fn read_i32(&mut self) -> Result<i32, String> {
+        Ok(i32::from_le_bytes(self.read_bytes::<4>()?))
+    }
+
+    fn read_f32(&mut self) -> Result<f32, String> {
+        Ok(f32::from_le_bytes(self.read_bytes::<4>()?))
+    }
+
+    fn read_u64(&mut self) -> Result<u64, String> {
+        Ok(u64::from_le_bytes(self.read_bytes::<8>()?))
+    }
+
+    fn read_i64(&mut self) -> Result<i64, String> {
+        Ok(i64::from_le_bytes(self.read_bytes::<8>()?))
+    }
+
+    fn read_f64(&mut self) -> Result<f64, String> {
+        Ok(f64::from_le_bytes(self.read_bytes::<8>()?))
+    }
+
+    fn read_string(&mut self, limit: u64, label: &str) -> Result<String, String> {
+        let byte_count = self.read_u64()?;
+        if byte_count > limit {
+            return Err(format!(
+                "GGUF {label} length {} exceeds safety limit {}",
+                byte_count, limit
+            ));
+        }
+
+        let byte_count = usize::try_from(byte_count)
+            .map_err(|_| format!("GGUF {label} length cannot fit in memory"))?;
+        let mut bytes = vec![0; byte_count];
+        self.file
+            .read_exact(&mut bytes)
+            .map_err(|err| format!("failed to read GGUF {label}: {err}"))?;
+        String::from_utf8(bytes).map_err(|err| format!("GGUF {label} is not valid UTF-8: {err}"))
+    }
+
+    fn skip_bytes(&mut self, byte_count: u64) -> Result<(), String> {
+        let offset = i64::try_from(byte_count)
+            .map_err(|_| format!("GGUF skip length {byte_count} exceeds seek range"))?;
+        self.file
+            .seek(SeekFrom::Current(offset))
+            .map(|_| ())
+            .map_err(|err| format!("failed to skip GGUF metadata bytes: {err}"))
+    }
+}
+
+fn read_gguf_scalar_value(
+    reader: &mut GgufReader,
+    value_type: u32,
+) -> Result<Option<GgufScalarValue>, String> {
+    match value_type {
+        0 => Ok(Some(GgufScalarValue::Unsigned(reader.read_u8()? as u64))),
+        1 => Ok(Some(GgufScalarValue::Signed(reader.read_i8()? as i64))),
+        2 => Ok(Some(GgufScalarValue::Unsigned(reader.read_u16()? as u64))),
+        3 => Ok(Some(GgufScalarValue::Signed(reader.read_i16()? as i64))),
+        4 => Ok(Some(GgufScalarValue::Unsigned(reader.read_u32()? as u64))),
+        5 => Ok(Some(GgufScalarValue::Signed(reader.read_i32()? as i64))),
+        6 => {
+            reader.read_f32()?;
+            Ok(None)
+        }
+        7 => {
+            reader.read_u8()?;
+            Ok(None)
+        }
+        GGUF_VALUE_TYPE_STRING => Ok(Some(GgufScalarValue::String(
+            reader.read_string(MAX_GGUF_STRING_BYTES, "string value")?,
+        ))),
+        GGUF_VALUE_TYPE_ARRAY => {
+            skip_gguf_array(reader, 0)?;
+            Ok(None)
+        }
+        10 => Ok(Some(GgufScalarValue::Unsigned(reader.read_u64()?))),
+        11 => Ok(Some(GgufScalarValue::Signed(reader.read_i64()?))),
+        12 => {
+            reader.read_f64()?;
+            Ok(None)
+        }
+        _ => Err(format!("unsupported GGUF metadata value type {value_type}")),
+    }
+}
+
+fn skip_gguf_array(reader: &mut GgufReader, depth: u8) -> Result<(), String> {
+    if depth >= MAX_GGUF_ARRAY_DEPTH {
+        return Err("GGUF metadata array nesting exceeds safety limit".to_string());
+    }
+
+    let child_type = reader.read_u32()?;
+    let item_count = reader.read_u64()?;
+    if item_count > MAX_GGUF_ARRAY_ITEMS {
+        return Err(format!(
+            "GGUF metadata array length {} exceeds safety limit {}",
+            item_count, MAX_GGUF_ARRAY_ITEMS
+        ));
+    }
+
+    if let Some(item_size) = gguf_fixed_value_size(child_type) {
+        let byte_count = item_size
+            .checked_mul(item_count)
+            .ok_or_else(|| "GGUF metadata array byte count overflowed".to_string())?;
+        return reader.skip_bytes(byte_count);
+    }
+
+    for _ in 0..item_count {
+        skip_gguf_value(reader, child_type, depth + 1)?;
+    }
+
+    Ok(())
+}
+
+fn skip_gguf_value(reader: &mut GgufReader, value_type: u32, depth: u8) -> Result<(), String> {
+    if let Some(item_size) = gguf_fixed_value_size(value_type) {
+        return reader.skip_bytes(item_size);
+    }
+
+    match value_type {
+        GGUF_VALUE_TYPE_STRING => {
+            let byte_count = reader.read_u64()?;
+            if byte_count > MAX_GGUF_STRING_BYTES {
+                return Err(format!(
+                    "GGUF string array item length {} exceeds safety limit {}",
+                    byte_count, MAX_GGUF_STRING_BYTES
+                ));
+            }
+            reader.skip_bytes(byte_count)
+        }
+        GGUF_VALUE_TYPE_ARRAY => skip_gguf_array(reader, depth),
+        _ => Err(format!("unsupported GGUF metadata value type {value_type}")),
+    }
+}
+
+fn gguf_fixed_value_size(value_type: u32) -> Option<u64> {
+    match value_type {
+        0 | 1 | 7 => Some(1),
+        2 | 3 => Some(2),
+        4 | 5 | 6 => Some(4),
+        10 | 11 | 12 => Some(8),
+        _ => None,
+    }
+}
+
+fn gguf_string(values: &HashMap<String, GgufScalarValue>, key: &str) -> Option<String> {
+    match values.get(key) {
+        Some(GgufScalarValue::String(value)) if !value.trim().is_empty() => {
+            Some(value.trim().to_string())
+        }
+        _ => None,
+    }
+}
+
+fn gguf_u64(values: &HashMap<String, GgufScalarValue>, key: &str) -> Option<u64> {
+    match values.get(key) {
+        Some(GgufScalarValue::Unsigned(value)) => Some(*value),
+        Some(GgufScalarValue::Signed(value)) if *value >= 0 => Some(*value as u64),
+        _ => None,
+    }
+}
+
+fn gguf_u32(values: &HashMap<String, GgufScalarValue>, key: &str) -> Option<u32> {
+    gguf_u64(values, key).and_then(|value| u32::try_from(value).ok())
+}
+
+fn gguf_u16(values: &HashMap<String, GgufScalarValue>, key: &str) -> Option<u16> {
+    gguf_u64(values, key).and_then(|value| u16::try_from(value).ok())
+}
+
+fn first_gguf_u32_by_suffix(
+    values: &HashMap<String, GgufScalarValue>,
+    suffix: &str,
+) -> Option<u32> {
+    values
+        .iter()
+        .find(|(key, _)| key.ends_with(suffix))
+        .and_then(|(key, _)| gguf_u32(values, key))
+}
+
+fn first_gguf_u16_by_suffix(
+    values: &HashMap<String, GgufScalarValue>,
+    suffix: &str,
+) -> Option<u16> {
+    values
+        .iter()
+        .find(|(key, _)| key.ends_with(suffix))
+        .and_then(|(key, _)| gguf_u16(values, key))
+}
+
+fn gguf_file_type_label(file_type: u64) -> String {
+    match file_type {
+        0 => "F32",
+        1 => "F16",
+        2 => "Q4_0",
+        3 => "Q4_1",
+        4 => "Q4_1+F16",
+        5 => "Q4_2",
+        6 => "Q4_3",
+        7 => "Q8_0",
+        8 => "Q5_0",
+        9 => "Q5_1",
+        10 => "Q2_K",
+        11 => "Q3_K_S",
+        12 => "Q3_K_M",
+        13 => "Q3_K_L",
+        14 => "Q4_K_S",
+        15 => "Q4_K_M",
+        16 => "Q5_K_S",
+        17 => "Q5_K_M",
+        18 => "Q6_K",
+        _ => return format!("FILE_TYPE_{file_type}"),
+    }
+    .to_string()
+}
+
+fn gguf_display_name(summary: &GgufMetadataSummary, fallback: &str) -> String {
+    if let Some(name) = summary.name.as_deref().filter(|name| !name.is_empty()) {
+        return name.to_string();
+    }
+
+    match (
+        summary.basename.as_deref(),
+        summary.parameter_size.as_deref(),
+    ) {
+        (Some(basename), Some(size)) if !basename.is_empty() && !size.is_empty() => {
+            format!("{basename} {size}")
+        }
+        (Some(basename), _) if !basename.is_empty() => basename.to_string(),
+        _ => fallback.to_string(),
+    }
+}
+
+fn infer_quantization_from_name(model_name: &str) -> Option<String> {
+    let upper = model_name.to_ascii_uppercase();
+    [
+        "Q8_0", "Q6_K", "Q5_K_M", "Q5_K_S", "Q5_1", "Q5_0", "Q4_K_M", "Q4_K_S", "Q4_1", "Q4_0",
+        "Q3_K_L", "Q3_K_M", "Q3_K_S", "Q2_K", "F16", "F32",
+    ]
+    .iter()
+    .find(|quantization| upper.contains(**quantization))
+    .map(|quantization| (*quantization).to_string())
+}
+
+fn estimate_layer_count(model_name: &str, block_count: Option<u16>) -> u16 {
+    if let Some(block_count) = block_count.filter(|count| *count > 0) {
+        return block_count;
+    }
+
     let lower = model_name.to_ascii_lowercase();
     if lower.contains("405b") {
         126
@@ -960,17 +1409,49 @@ fn collect_models(directory: &Path, models: &mut Vec<ModelRecord>) -> Result<(),
         let metadata = entry
             .metadata()
             .map_err(|err| format!("failed to read model metadata {}: {err}", path.display()))?;
-        let name = path
+        let fallback_name = path
             .file_stem()
             .and_then(|stem| stem.to_str())
             .unwrap_or("Unnamed model")
             .to_string();
+        let gguf_metadata = read_model_gguf_metadata(&path);
+        let name = gguf_metadata
+            .as_ref()
+            .map(|summary| gguf_display_name(summary, &fallback_name))
+            .unwrap_or_else(|| fallback_name.clone());
         let format = path
             .extension()
             .and_then(|extension| extension.to_str())
             .unwrap_or("unknown")
             .to_ascii_uppercase();
         let size_gib = bytes_to_gib(metadata.len());
+        let architecture = gguf_metadata
+            .as_ref()
+            .and_then(|summary| summary.architecture.clone());
+        let parameter_size = gguf_metadata
+            .as_ref()
+            .and_then(|summary| summary.parameter_size.clone());
+        let quantization = gguf_metadata
+            .as_ref()
+            .and_then(|summary| summary.quantization.clone())
+            .or_else(|| infer_quantization_from_name(&fallback_name));
+        let context_length = gguf_metadata
+            .as_ref()
+            .and_then(|summary| summary.context_length);
+        let block_count = gguf_metadata
+            .as_ref()
+            .and_then(|summary| summary.block_count);
+        let tensor_count = gguf_metadata.as_ref().map(|summary| summary.tensor_count);
+        let gguf_version = gguf_metadata.as_ref().map(|summary| summary.version);
+        let metadata_source = gguf_metadata
+            .as_ref()
+            .map(|summary| format!("GGUF v{}", summary.version))
+            .unwrap_or_else(|| "filename".to_string());
+        let status = if gguf_metadata.is_some() {
+            "Indexed"
+        } else {
+            "Discovered"
+        };
 
         models.push(ModelRecord {
             id: path.to_string_lossy().to_string(),
@@ -978,12 +1459,27 @@ fn collect_models(directory: &Path, models: &mut Vec<ModelRecord>) -> Result<(),
             path: path.to_string_lossy().to_string(),
             format,
             size_gib,
-            status: "Discovered".to_string(),
+            status: status.to_string(),
             fit: model_fit_label(size_gib),
+            architecture,
+            parameter_size,
+            quantization,
+            context_length,
+            block_count,
+            tensor_count,
+            gguf_version,
+            metadata_source,
         });
     }
 
     Ok(())
+}
+
+fn is_gguf_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.eq_ignore_ascii_case("gguf"))
+        .unwrap_or(false)
 }
 
 fn is_supported_model_file(path: &Path) -> bool {
@@ -1027,6 +1523,75 @@ fn percent(used: f64, total: f64) -> f32 {
     }
 
     ((used / total) * 100.0).clamp(0.0, 100.0) as f32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn parses_minimal_gguf_metadata() {
+        let path = env::temp_dir().join(format!(
+            "kivarro-gguf-metadata-{}-{}.gguf",
+            std::process::id(),
+            unix_timestamp()
+        ));
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(GGUF_MAGIC);
+        bytes.extend_from_slice(&3_u32.to_le_bytes());
+        bytes.extend_from_slice(&123_u64.to_le_bytes());
+        bytes.extend_from_slice(&6_u64.to_le_bytes());
+
+        push_gguf_string_kv(&mut bytes, "general.architecture", "llama");
+        push_gguf_string_kv(&mut bytes, "general.name", "Kivarro Test Model");
+        push_gguf_string_kv(&mut bytes, "general.size_label", "7B");
+        push_gguf_u32_kv(&mut bytes, "general.file_type", 15);
+        push_gguf_u64_kv(&mut bytes, "llama.context_length", 32_768);
+        push_gguf_u64_kv(&mut bytes, "llama.block_count", 32);
+
+        let mut file = File::create(&path).expect("create synthetic GGUF");
+        file.write_all(&bytes).expect("write synthetic GGUF");
+        drop(file);
+
+        let summary = read_gguf_metadata_summary(&path)
+            .expect("parse synthetic GGUF")
+            .expect("GGUF metadata summary");
+
+        assert_eq!(summary.version, 3);
+        assert_eq!(summary.tensor_count, 123);
+        assert_eq!(summary.name.as_deref(), Some("Kivarro Test Model"));
+        assert_eq!(summary.architecture.as_deref(), Some("llama"));
+        assert_eq!(summary.parameter_size.as_deref(), Some("7B"));
+        assert_eq!(summary.quantization.as_deref(), Some("Q4_K_M"));
+        assert_eq!(summary.context_length, Some(32_768));
+        assert_eq!(summary.block_count, Some(32));
+
+        fs::remove_file(path).expect("remove synthetic GGUF");
+    }
+
+    fn push_gguf_string_kv(bytes: &mut Vec<u8>, key: &str, value: &str) {
+        push_gguf_string(bytes, key);
+        bytes.extend_from_slice(&GGUF_VALUE_TYPE_STRING.to_le_bytes());
+        push_gguf_string(bytes, value);
+    }
+
+    fn push_gguf_u32_kv(bytes: &mut Vec<u8>, key: &str, value: u32) {
+        push_gguf_string(bytes, key);
+        bytes.extend_from_slice(&4_u32.to_le_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_gguf_u64_kv(bytes: &mut Vec<u8>, key: &str, value: u64) {
+        push_gguf_string(bytes, key);
+        bytes.extend_from_slice(&10_u32.to_le_bytes());
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn push_gguf_string(bytes: &mut Vec<u8>, value: &str) {
+        bytes.extend_from_slice(&(value.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(value.as_bytes());
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

@@ -154,7 +154,19 @@
     : 0;
   $: ramPercent = metrics ? clamp((metrics.ramUsedGib / Math.max(metrics.ramTotalGib, 1)) * 100, 0, 100) : 0;
   $: filteredModels = models.filter((model) =>
-    `${model.name} ${model.format} ${model.path}`.toLowerCase().includes(modelFilter.toLowerCase()),
+    [
+      model.name,
+      model.format,
+      model.path,
+      model.architecture,
+      model.parameterSize,
+      model.quantization,
+      model.metadataSource,
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase()
+      .includes(modelFilter.toLowerCase()),
   );
   $: filteredLogs =
     logFilter === "ALL" ? logs : logs.filter((entry) => entry.level.toUpperCase() === logFilter);
@@ -287,6 +299,19 @@
 
   function formatTokens(value: number) {
     return new Intl.NumberFormat("en-US").format(value);
+  }
+
+  function optionalText(value: string | null | undefined, fallback = "unknown") {
+    const trimmed = value?.trim();
+    return trimmed ? trimmed : fallback;
+  }
+
+  function formatTokenLimit(value: number | null | undefined) {
+    return value && value > 0 ? formatTokens(value) : "unknown";
+  }
+
+  function formatLayerCount(value: number | null | undefined) {
+    return value && value > 0 ? `${value}` : "estimated";
   }
 
   function controlsFromProfile(profile: InferenceProfile) {
@@ -481,7 +506,10 @@
           {#each filteredModels as model}
             <button class:active={selectedModelId === model.id} class="model-mini" onclick={() => selectModel(model.id)}>
               <span>{model.name}</span>
-              <small>{model.format} / {formatNumber(model.sizeGib)} GiB</small>
+              <small>
+                {optionalText(model.architecture)} / {optionalText(model.quantization, model.format)} /
+                {formatTokenLimit(model.contextLength)} ctx
+              </small>
             </button>
           {/each}
         {/if}
@@ -621,10 +649,12 @@
           <section class="model-table">
             <div class="table-row header">
               <span>Name</span>
-              <span>Format</span>
+              <span>Arch</span>
+              <span>Quant</span>
+              <span>Context</span>
+              <span>Layers</span>
               <span>Size</span>
               <span>Fit</span>
-              <span>Status</span>
             </div>
             {#each filteredModels as model}
               <button
@@ -632,11 +662,16 @@
                 class="table-row model-row"
                 onclick={() => selectModel(model.id)}
               >
-                <span>{model.name}</span>
-                <code>{model.format}</code>
+                <span class="model-name-cell">
+                  <strong>{model.name}</strong>
+                  <small>{model.metadataSource}</small>
+                </span>
+                <code>{optionalText(model.architecture)}</code>
+                <code>{optionalText(model.quantization, model.format)}</code>
+                <code>{formatTokenLimit(model.contextLength)}</code>
+                <code>{formatLayerCount(model.blockCount)}</code>
                 <code>{formatNumber(model.sizeGib)} GiB</code>
                 <span class:good={model.fit === "Fits"} class:warn={model.fit !== "Fits"}>{model.fit}</span>
-                <span>{model.status}</span>
               </button>
             {/each}
           </section>
@@ -652,6 +687,22 @@
               <div>
                 <span>Fit</span>
                 <strong>{loadPlan.fit}</strong>
+              </div>
+              <div>
+                <span>Metadata</span>
+                <strong>{loadPlan.metadataSource}</strong>
+              </div>
+              <div>
+                <span>Architecture</span>
+                <strong>{optionalText(loadPlan.architecture)}</strong>
+              </div>
+              <div>
+                <span>Quantization</span>
+                <strong>{optionalText(loadPlan.quantization)}</strong>
+              </div>
+              <div>
+                <span>Model context</span>
+                <strong>{formatTokenLimit(loadPlan.modelContextLength)}</strong>
               </div>
               <div>
                 <span>Layers</span>
@@ -721,7 +772,10 @@
               bind:value={sampling.gpuLayers}
               onchange={() => void updateLoadPlan()}
             />
-            <code>{sampling.gpuLayers} layers / {loadPlan?.estimatedLayers ?? 96} estimated</code>
+            <code>
+              {sampling.gpuLayers} layers / {loadPlan?.estimatedLayers ?? 96}
+              {loadPlan?.metadataSource?.startsWith("GGUF") ? "from GGUF" : "estimated"}
+            </code>
           </div>
           <div>
             <label for="context-length">Context length</label>
@@ -1075,6 +1129,38 @@
           <code>{profileSaveStatus}</code>
         </div>
         <button class="inspector-action" onclick={saveCurrentProfile}>Save profile</button>
+      </section>
+
+      <section class="inspector-section">
+        <div class="section-label">Selected Model</div>
+        {#if selectedModel}
+          <div class="stat-row">
+            <span>Name</span>
+            <code>{selectedModel.name}</code>
+          </div>
+          <div class="stat-row">
+            <span>Arch</span>
+            <code>{optionalText(selectedModel.architecture)}</code>
+          </div>
+          <div class="stat-row">
+            <span>Quant</span>
+            <code>{optionalText(selectedModel.quantization, selectedModel.format)}</code>
+          </div>
+          <div class="stat-row">
+            <span>Context</span>
+            <code>{formatTokenLimit(selectedModel.contextLength)}</code>
+          </div>
+          <div class="stat-row">
+            <span>Layers</span>
+            <code>{formatLayerCount(selectedModel.blockCount)}</code>
+          </div>
+          <div class="stat-row">
+            <span>Source</span>
+            <code>{selectedModel.metadataSource}</code>
+          </div>
+        {:else}
+          <p class="muted-copy">No model selected.</p>
+        {/if}
       </section>
 
       <section class="inspector-section">
@@ -1792,18 +1878,50 @@
   }
 
   .model-table {
-    overflow: hidden;
+    overflow: auto;
   }
 
   .table-row {
     display: grid;
-    grid-template-columns: minmax(0, 2fr) 100px 120px 120px 120px;
+    grid-template-columns: minmax(180px, 2fr) 92px 96px 110px 88px 96px 104px;
     gap: 12px;
     align-items: center;
     min-height: 42px;
+    min-width: 860px;
     padding: 0 12px;
     border-bottom: 1px solid var(--border);
     font-size: 13px;
+  }
+
+  .table-row > *,
+  .stat-row > * {
+    min-width: 0;
+  }
+
+  .table-row code,
+  .stat-row code {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .model-name-cell {
+    display: grid;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .model-name-cell strong,
+  .model-name-cell small {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .model-name-cell small {
+    color: var(--dim);
+    font-family: var(--mono);
+    font-size: 11px;
   }
 
   .model-row {
