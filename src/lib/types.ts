@@ -232,6 +232,38 @@ export interface BenchmarkResult {
   loadDurationMs: number;
 }
 
+export interface KnowledgeBase {
+  id: string;
+  name: string;
+  documentCount: number;
+  chunkCount: number;
+  updatedAt: string;
+}
+
+export interface KnowledgeDocument {
+  id: string;
+  knowledgeBaseId: string;
+  name: string;
+  path: string;
+  sizeBytes: number;
+  chunkCount: number;
+  importedAt: string;
+}
+
+export interface KnowledgeBaseDetail {
+  base: KnowledgeBase;
+  documents: KnowledgeDocument[];
+}
+
+export interface RetrievalMatch {
+  knowledgeBaseId: string;
+  documentId: string;
+  documentName: string;
+  chunkIndex: number;
+  score: number;
+  snippet: string;
+}
+
 export interface LogEntry {
   level: "INFO" | "WARN" | "ERROR" | "DEBUG" | string;
   source: string;

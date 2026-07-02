@@ -7,9 +7,13 @@ import type {
   HardwareSnapshot,
   InferenceProfile,
   InferenceRunResult,
+  KnowledgeBase,
+  KnowledgeBaseDetail,
+  KnowledgeDocument,
   LogEntry,
   ModelRecord,
   ModelLoadPlan,
+  RetrievalMatch,
   RuntimeMetrics,
 } from "./types";
 
@@ -87,6 +91,16 @@ const fallbackEngineStatus: EngineStatus = {
   contextUsedTokens: 0,
   contextTotalTokens: 32768,
 };
+
+const fallbackKnowledgeBases: KnowledgeBase[] = [
+  {
+    id: "research-vault",
+    name: "Research Vault",
+    documentCount: 0,
+    chunkCount: 0,
+    updatedAt: "preview",
+  },
+];
 
 export const fallbackProfiles: InferenceProfile[] = [
   {
@@ -426,6 +440,36 @@ export function runBenchmark(
   profile: InferenceProfile,
 ): Promise<BenchmarkResult[]> {
   return invokeOrPreview("run_benchmark", [], { modelId, profile });
+}
+
+export function listKnowledgeBases(): Promise<KnowledgeBase[]> {
+  return safeInvoke("list_knowledge_bases", fallbackKnowledgeBases);
+}
+
+export function createKnowledgeBase(name: string): Promise<KnowledgeBase[]> {
+  return invokeOrPreview("create_knowledge_base", fallbackKnowledgeBases, { name });
+}
+
+export function listKnowledgeDocuments(knowledgeBaseId: string): Promise<KnowledgeDocument[]> {
+  return safeInvoke("list_knowledge_documents", [], { knowledgeBaseId });
+}
+
+export function importKnowledgeDocument(
+  knowledgeBaseId: string,
+  path: string,
+): Promise<KnowledgeBaseDetail> {
+  return invokeOrPreview(
+    "import_knowledge_document",
+    { base: fallbackKnowledgeBases[0], documents: [] },
+    { knowledgeBaseId, path },
+  );
+}
+
+export function testKnowledgeRetrieval(
+  knowledgeBaseId: string,
+  query: string,
+): Promise<RetrievalMatch[]> {
+  return invokeOrPreview("test_knowledge_retrieval", [], { knowledgeBaseId, query });
 }
 
 export function listSystemLogs(): Promise<LogEntry[]> {

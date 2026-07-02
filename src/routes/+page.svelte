@@ -42,13 +42,17 @@
   import {
     cancelChatCompletionStream,
     fallbackProfiles,
+    createKnowledgeBase,
     getApiStatus,
     getEngineStatus,
     getHardwareSnapshot,
     getModelLoadPlan,
     getRuntimeMetrics,
+    importKnowledgeDocument,
     listBenchmarkResults,
     listInferenceProfiles,
+    listKnowledgeBases,
+    listKnowledgeDocuments,
     listModels,
     listSystemLogs,
     runBenchmark,
@@ -56,6 +60,7 @@
     saveInferenceProfile,
     startInferenceEngine,
     stopInferenceEngine,
+    testKnowledgeRetrieval,
   } from "$lib/api";
   import type {
     ApiStatus,
@@ -66,9 +71,12 @@
     InferenceProfile,
     InferenceRunResult,
     InferenceStreamEvent,
+    KnowledgeBase,
+    KnowledgeDocument,
     LogEntry,
     ModelRecord,
     ModelLoadPlan,
+    RetrievalMatch,
     RuntimeMetrics,
     ViewId,
   } from "$lib/types";
@@ -107,7 +115,6 @@
     { title: "Previous 7 Days", items: ["Long context summary", "RAG retrieval audit"] },
   ];
 
-  const knowledgeBases = ["Research Vault", "Codebase Memory", "Paper Notes"];
   const agentTools = [
     { name: "Local terminal", enabled: false, danger: true },
     { name: "Web search", enabled: false, danger: false },
@@ -131,8 +138,13 @@
   let engineNotice = "";
   let promptBusy = false;
   let benchmarkBusy = false;
+  let knowledgeBusy = false;
   let generationCancelling = false;
   let currentStreamRequestId = "";
+  let selectedKnowledgeBaseId = "";
+  let knowledgeImportPath = "";
+  let newKnowledgeBaseName = "";
+  let retrievalQuery = "";
 
   let hardware: HardwareSnapshot | null = null;
   let metrics: RuntimeMetrics | null = null;
@@ -143,6 +155,9 @@
   let engineStatus: EngineStatus | null = null;
   let benchmarks: BenchmarkResult[] = [];
   let logs: LogEntry[] = [];
+  let knowledgeBases: KnowledgeBase[] = [];
+  let knowledgeDocuments: KnowledgeDocument[] = [];
+  let retrievalResults: RetrievalMatch[] = [];
 
   let sampling = controlsFromProfile(fallbackProfiles[0]);
 
@@ -189,6 +204,8 @@
   );
   $: filteredLogs =
     logFilter === "ALL" ? logs : logs.filter((entry) => entry.level.toUpperCase() === logFilter);
+  $: activeKnowledgeBase =
+    knowledgeBases.find((base) => base.id === selectedKnowledgeBaseId) ?? knowledgeBases[0] ?? null;
   $: engineOnline = engineStatus?.state === "ready";
   $: engineLoading = engineStatus?.state === "loading";
   $: engineLabel = engineBusy
@@ -243,6 +260,7 @@
       nextApiStatus,
       nextEngineStatus,
       nextBenchmarks,
+      nextKnowledgeBases,
       nextLogs,
     ] =
       await Promise.all([
@@ -253,6 +271,7 @@
         getApiStatus(),
         getEngineStatus(),
         listBenchmarkResults(),
+        listKnowledgeBases(),
         listSystemLogs(),
       ]);
 
@@ -267,6 +286,11 @@
     engineStatus = nextEngineStatus;
     engineNotice = nextEngineStatus.message;
     benchmarks = nextBenchmarks;
+    knowledgeBases = nextKnowledgeBases;
+    selectedKnowledgeBaseId = nextKnowledgeBases[0]?.id ?? "";
+    knowledgeDocuments = selectedKnowledgeBaseId
+      ? await listKnowledgeDocuments(selectedKnowledgeBaseId)
+      : [];
     logs = nextLogs;
     await updateLoadPlan();
   }
@@ -301,6 +325,33 @@
   function selectModel(modelId: string) {
     selectedModelId = modelId;
     void updateLoadPlan();
+  }
+
+  async function selectKnowledgeBase(knowledgeBaseId: string) {
+    selectedKnowledgeBaseId = knowledgeBaseId;
+    retrievalResults = [];
+    knowledgeDocuments = await listKnowledgeDocuments(knowledgeBaseId);
+  }
+
+  async function createCurrentKnowledgeBase() {
+    const name = newKnowledgeBaseName.trim();
+    if (!name || knowledgeBusy) return;
+
+    knowledgeBusy = true;
+    try {
+      knowledgeBases = await createKnowledgeBase(name);
+      const created = knowledgeBases.find((base) => base.name === name) ?? knowledgeBases[0];
+      selectedKnowledgeBaseId = created?.id ?? "";
+      knowledgeDocuments = selectedKnowledgeBaseId
+        ? await listKnowledgeDocuments(selectedKnowledgeBaseId)
+        : [];
+      retrievalResults = [];
+      newKnowledgeBaseName = "";
+    } catch (error) {
+      addSystemMessage("Knowledge", errorMessage(error));
+    } finally {
+      knowledgeBusy = false;
+    }
   }
 
   async function updateLoadPlan(profile = buildProfileFromControls()) {
@@ -364,6 +415,41 @@
       addSystemMessage("Engine", engineNotice);
     } finally {
       engineBusy = false;
+    }
+  }
+
+  async function importKnowledgePath() {
+    if (!selectedKnowledgeBaseId || !knowledgeImportPath.trim() || knowledgeBusy) return;
+
+    knowledgeBusy = true;
+    try {
+      const detail = await importKnowledgeDocument(selectedKnowledgeBaseId, knowledgeImportPath);
+      knowledgeBases = [
+        detail.base,
+        ...knowledgeBases.filter((base) => base.id !== detail.base.id),
+      ].sort((left, right) => left.name.localeCompare(right.name));
+      knowledgeDocuments = detail.documents;
+      selectedKnowledgeBaseId = detail.base.id;
+      retrievalResults = [];
+      knowledgeImportPath = "";
+    } catch (error) {
+      addSystemMessage("Knowledge", errorMessage(error));
+    } finally {
+      knowledgeBusy = false;
+    }
+  }
+
+  async function runRetrievalTest() {
+    if (!selectedKnowledgeBaseId || !retrievalQuery.trim() || knowledgeBusy) return;
+
+    knowledgeBusy = true;
+    try {
+      retrievalResults = await testKnowledgeRetrieval(selectedKnowledgeBaseId, retrievalQuery);
+    } catch (error) {
+      retrievalResults = [];
+      addSystemMessage("Knowledge", errorMessage(error));
+    } finally {
+      knowledgeBusy = false;
     }
   }
 
@@ -823,10 +909,28 @@
         </div>
       {:else if activeView === "knowledge"}
         <div class="section-label">Knowledge bases</div>
-        {#each knowledgeBases as base}
-          <button class="history-item">
+        <div class="kb-create-row">
+          <input
+            aria-label="New knowledge base"
+            placeholder="New base name"
+            bind:value={newKnowledgeBaseName}
+            onkeydown={(event) => {
+              if (event.key === "Enter") void createCurrentKnowledgeBase();
+            }}
+          />
+          <button class="tool-button" disabled={knowledgeBusy || !newKnowledgeBaseName.trim()} onclick={createCurrentKnowledgeBase}>
             <Database size={14} />
-            {base}
+          </button>
+        </div>
+        {#each knowledgeBases as base}
+          <button
+            class:active={selectedKnowledgeBaseId === base.id}
+            class="history-item"
+            onclick={() => void selectKnowledgeBase(base.id)}
+          >
+            <Database size={14} />
+            <span>{base.name}</span>
+            <code>{base.chunkCount}</code>
           </button>
         {/each}
       {:else if activeView === "logs"}
@@ -1278,33 +1382,92 @@
         <section class="workspace-header">
           <div>
             <p class="eyebrow">RAG Knowledge Bases</p>
-            <h1>Local retrieval pipeline</h1>
+            <h1>{activeKnowledgeBase?.name ?? "Local retrieval pipeline"}</h1>
           </div>
-          <button class="primary-button">
-            <FileText size={15} />
-            Import documents
-          </button>
+          <div class="import-row">
+            <input
+              aria-label="Document path"
+              placeholder="Paste absolute path to .md, .txt, or source file"
+              bind:value={knowledgeImportPath}
+              onkeydown={(event) => {
+                if (event.key === "Enter") void importKnowledgePath();
+              }}
+            />
+            <button class="primary-button" disabled={knowledgeBusy || !knowledgeImportPath.trim()} onclick={importKnowledgePath}>
+              <FileText size={15} />
+              Import
+            </button>
+          </div>
         </section>
 
         <section class="rag-grid">
-          {#each ["Documents", "Chunking Strategy", "Embedding Model"] as column, index}
-            <article>
-              <div class="panel-header inline">
-                <span>{column}</span>
-                <code>{index === 0 ? "0 files" : "pending"}</code>
-              </div>
+          <article>
+            <div class="panel-header inline">
+              <span>Documents</span>
+              <code>{knowledgeDocuments.length} files</code>
+            </div>
+            {#if knowledgeDocuments.length === 0}
               <div class="empty-state compact">
                 <FolderOpen size={26} />
-                <span>{index === 0 ? "Drop PDFs, Markdown, or source files here." : "Configure after documents are attached."}</span>
+                <span>Paste a local text, Markdown, or source-file path above.</span>
               </div>
-            </article>
-          {/each}
+            {:else}
+              <div class="document-list">
+                {#each knowledgeDocuments as document}
+                  <div>
+                    <strong>{document.name}</strong>
+                    <span>{formatTokens(document.chunkCount)} chunks · {formatTokens(document.sizeBytes)} bytes</span>
+                  </div>
+                {/each}
+              </div>
+            {/if}
+          </article>
+          <article>
+            <div class="panel-header inline">
+              <span>Chunking Strategy</span>
+              <code>{activeKnowledgeBase?.chunkCount ?? 0} chunks</code>
+            </div>
+            <div class="rag-metric-grid">
+              <div><span>Target</span><strong>1,200 chars</strong></div>
+              <div><span>Overlap</span><strong>160 chars</strong></div>
+              <div><span>Ranker</span><strong>Lexical cosine-lite</strong></div>
+            </div>
+          </article>
+          <article>
+            <div class="panel-header inline">
+              <span>Embedding Model</span>
+              <code>local lexical</code>
+            </div>
+            <div class="empty-state compact">
+              <Database size={26} />
+              <span>Embeddings endpoint remains planned; retrieval is functional with deterministic lexical ranking.</span>
+            </div>
+          </article>
         </section>
 
         <section class="retrieval-dock">
-          <input placeholder="Test retrieval query..." />
-          <button class="tool-button">Run semantic search</button>
+          <input
+            placeholder="Test retrieval query..."
+            bind:value={retrievalQuery}
+            onkeydown={(event) => {
+              if (event.key === "Enter") void runRetrievalTest();
+            }}
+          />
+          <button class="tool-button" disabled={knowledgeBusy || !retrievalQuery.trim()} onclick={runRetrievalTest}>Run retrieval</button>
         </section>
+        {#if retrievalResults.length > 0}
+          <section class="retrieval-results">
+            {#each retrievalResults as result}
+              <article>
+                <div class="panel-header inline">
+                  <span>{result.documentName}</span>
+                  <code>{formatNumber(result.score * 100, 0)}%</code>
+                </div>
+                <p>{result.snippet}</p>
+              </article>
+            {/each}
+          </section>
+        {/if}
       {:else if activeView === "agents"}
         <section class="workspace-header">
           <div>
@@ -1901,10 +2064,27 @@
     padding: 0 8px;
   }
 
+  .history-item span {
+    min-width: 0;
+    flex: 1;
+  }
+
   .history-item:hover,
   .model-mini:hover {
     color: var(--text);
     background: var(--panel-2);
+  }
+
+  .history-item.active {
+    color: var(--text);
+    border-color: color-mix(in srgb, var(--cyan) 36%, var(--border));
+    background: color-mix(in srgb, var(--cyan) 9%, var(--panel-2));
+  }
+
+  .kb-create-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 36px;
+    gap: 6px;
   }
 
   .drop-zone {
@@ -2579,6 +2759,57 @@
   .rag-grid article {
     min-height: 300px;
     padding: 14px;
+  }
+
+  .import-row {
+    min-width: min(560px, 100%);
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px;
+  }
+
+  .document-list,
+  .retrieval-results {
+    display: grid;
+    gap: 8px;
+  }
+
+  .document-list div,
+  .retrieval-results article,
+  .rag-metric-grid div {
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: var(--panel-2);
+  }
+
+  .document-list strong,
+  .document-list span,
+  .rag-metric-grid span,
+  .rag-metric-grid strong {
+    display: block;
+  }
+
+  .document-list span,
+  .rag-metric-grid span,
+  .retrieval-results p {
+    color: var(--muted);
+    font-size: 12px;
+  }
+
+  .rag-metric-grid {
+    display: grid;
+    gap: 8px;
+  }
+
+  .retrieval-results article {
+    display: grid;
+    gap: 8px;
+  }
+
+  .retrieval-results p {
+    margin: 0;
+    line-height: 1.55;
   }
 
   .retrieval-dock,

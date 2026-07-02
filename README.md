@@ -14,6 +14,7 @@ Kivarro is a Rust/Tauri local model inference workstation for Windows, macOS, an
 - Model load-plan estimator for RAM pressure, KV cache allocation, runtime overhead, and GPU/CPU layer split, using GGUF layer/context metadata when available.
 - Engine supervisor for loading a selected local model through either `llama.cpp` `llama-server` or `mistral.rs` `mistralrs serve`, with OpenAI-compatible chat completions, live token streaming, and stop controls in Command Center.
 - Tokens/sec benchmark runner for the loaded model, persisted under the app config directory with eval count, eval duration, tokens/sec, and load duration.
+- Local RAG knowledge bases with persisted document metadata, UTF-8 text/Markdown/source ingestion, deterministic chunking, and retrieval test ranking.
 - Browser-preview fallbacks for UI smoke testing outside Tauri.
 - Windows ARM64 release bundling verified with MSI and NSIS outputs.
 
@@ -85,5 +86,5 @@ Profiles are saved as `.kivarro.json` files through the Tauri backend. The profi
 - Deeper `mistral.rs` runtime flag mapping for GPU, quantization, and context controls.
 - GPU vendor-specific utilization adapters beyond NVIDIA SMI.
 - Built-in OpenAI-compatible proxy/server for external clients.
-- RAG ingestion, vector indexing, retrieval testing, and citations.
+- Embedding-backed vector indexing and citation injection for RAG.
 - Benchmark CSV export and comparison filters.

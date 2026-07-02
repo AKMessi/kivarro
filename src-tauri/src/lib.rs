@@ -23,6 +23,11 @@ use std::os::windows::process::CommandExt;
 const PROFILE_EXTENSION: &str = "kivarro.json";
 const BENCHMARK_RESULTS_FILE: &str = "benchmarks.json";
 const MAX_BENCHMARK_RESULTS: usize = 200;
+const KNOWLEDGE_STORE_FILE: &str = "knowledge-store.json";
+const MAX_KNOWLEDGE_DOCUMENT_BYTES: u64 = 8 * 1024 * 1024;
+const KNOWLEDGE_CHUNK_TARGET_CHARS: usize = 1_200;
+const KNOWLEDGE_CHUNK_OVERLAP_CHARS: usize = 160;
+const MAX_RETRIEVAL_RESULTS: usize = 8;
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 const GGUF_VALUE_TYPE_ARRAY: u32 = 9;
 const GGUF_VALUE_TYPE_STRING: u32 = 8;
@@ -272,6 +277,65 @@ struct BenchmarkResult {
     eval_duration_ms: u64,
     tokens_per_second: f32,
     load_duration_ms: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct KnowledgeBase {
+    id: String,
+    name: String,
+    document_count: u32,
+    chunk_count: u32,
+    updated_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct KnowledgeDocument {
+    id: String,
+    knowledge_base_id: String,
+    name: String,
+    path: String,
+    size_bytes: u64,
+    chunk_count: u32,
+    imported_at: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct KnowledgeChunk {
+    id: String,
+    knowledge_base_id: String,
+    document_id: String,
+    document_name: String,
+    chunk_index: u32,
+    content: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct KnowledgeStore {
+    bases: Vec<KnowledgeBase>,
+    documents: Vec<KnowledgeDocument>,
+    chunks: Vec<KnowledgeChunk>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KnowledgeBaseDetail {
+    base: KnowledgeBase,
+    documents: Vec<KnowledgeDocument>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RetrievalMatch {
+    knowledge_base_id: String,
+    document_id: String,
+    document_name: String,
+    chunk_index: u32,
+    score: f32,
+    snippet: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1654,6 +1718,169 @@ fn run_benchmark(
 }
 
 #[tauri::command]
+fn list_knowledge_bases(app_handle: AppHandle) -> Result<Vec<KnowledgeBase>, String> {
+    let mut store = read_knowledge_store(&app_handle)?;
+    ensure_default_knowledge_base(&mut store);
+    write_knowledge_store(&app_handle, &store)?;
+
+    Ok(store.bases)
+}
+
+#[tauri::command]
+fn create_knowledge_base(
+    app_handle: AppHandle,
+    name: String,
+) -> Result<Vec<KnowledgeBase>, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("knowledge base name is required".to_string());
+    }
+    let mut store = read_knowledge_store(&app_handle)?;
+    let id = unique_knowledge_base_id(&store, name);
+    let timestamp = unix_timestamp().to_string();
+    store.bases.push(KnowledgeBase {
+        id,
+        name: name.to_string(),
+        document_count: 0,
+        chunk_count: 0,
+        updated_at: timestamp,
+    });
+    sort_knowledge_bases(&mut store);
+    write_knowledge_store(&app_handle, &store)?;
+
+    Ok(store.bases)
+}
+
+#[tauri::command]
+fn list_knowledge_documents(
+    app_handle: AppHandle,
+    knowledge_base_id: String,
+) -> Result<Vec<KnowledgeDocument>, String> {
+    let store = read_knowledge_store(&app_handle)?;
+    let knowledge_base_id = sanitize_identifier(&knowledge_base_id);
+    Ok(documents_for_base(&store, &knowledge_base_id))
+}
+
+#[tauri::command]
+fn import_knowledge_document(
+    app_handle: AppHandle,
+    knowledge_base_id: String,
+    path: String,
+) -> Result<KnowledgeBaseDetail, String> {
+    let knowledge_base_id = sanitize_identifier(&knowledge_base_id);
+    if knowledge_base_id.is_empty() {
+        return Err("knowledge base id is required".to_string());
+    }
+    let mut store = read_knowledge_store(&app_handle)?;
+    ensure_default_knowledge_base(&mut store);
+    if !store.bases.iter().any(|base| base.id == knowledge_base_id) {
+        return Err(format!("knowledge base not found: {knowledge_base_id}"));
+    }
+
+    let document_path = canonical_knowledge_document_path(&path)?;
+    let metadata = fs::metadata(&document_path).map_err(|err| {
+        format!(
+            "failed to inspect document {}: {err}",
+            document_path.display()
+        )
+    })?;
+    if metadata.len() > MAX_KNOWLEDGE_DOCUMENT_BYTES {
+        return Err(format!(
+            "document exceeds {} MiB import limit",
+            MAX_KNOWLEDGE_DOCUMENT_BYTES / 1024 / 1024
+        ));
+    }
+
+    let raw = fs::read_to_string(&document_path).map_err(|err| {
+        format!(
+            "failed to read UTF-8 document {}: {err}",
+            document_path.display()
+        )
+    })?;
+    let chunks = chunk_document_text(&raw);
+    if chunks.is_empty() {
+        return Err("document did not contain indexable text".to_string());
+    }
+
+    let document_name = document_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("document")
+        .to_string();
+    let document_id = format!(
+        "{}-{}",
+        sanitize_identifier(&document_name),
+        unix_timestamp()
+    );
+    let document_path_string = document_path.to_string_lossy().to_string();
+    let replaced_document_ids = store
+        .documents
+        .iter()
+        .filter(|document| {
+            document.knowledge_base_id == knowledge_base_id && document.path == document_path_string
+        })
+        .map(|document| document.id.clone())
+        .collect::<Vec<_>>();
+    store
+        .documents
+        .retain(|document| !replaced_document_ids.iter().any(|id| id == &document.id));
+    store.chunks.retain(|chunk| {
+        !replaced_document_ids
+            .iter()
+            .any(|document_id| document_id == &chunk.document_id)
+    });
+
+    let imported_at = unix_timestamp().to_string();
+    store.documents.push(KnowledgeDocument {
+        id: document_id.clone(),
+        knowledge_base_id: knowledge_base_id.clone(),
+        name: document_name.clone(),
+        path: document_path_string,
+        size_bytes: metadata.len(),
+        chunk_count: chunks.len() as u32,
+        imported_at,
+    });
+    for (index, content) in chunks.into_iter().enumerate() {
+        store.chunks.push(KnowledgeChunk {
+            id: format!("{document_id}-{index}"),
+            knowledge_base_id: knowledge_base_id.clone(),
+            document_id: document_id.clone(),
+            document_name: document_name.clone(),
+            chunk_index: index as u32,
+            content,
+        });
+    }
+    refresh_knowledge_base_counts(&mut store, &knowledge_base_id);
+    sort_knowledge_bases(&mut store);
+    write_knowledge_store(&app_handle, &store)?;
+
+    knowledge_base_detail(&store, &knowledge_base_id)
+}
+
+#[tauri::command]
+fn test_knowledge_retrieval(
+    app_handle: AppHandle,
+    knowledge_base_id: String,
+    query: String,
+) -> Result<Vec<RetrievalMatch>, String> {
+    let knowledge_base_id = sanitize_identifier(&knowledge_base_id);
+    let query_terms = tokenize_for_retrieval(&query);
+    if query_terms.is_empty() {
+        return Err("retrieval query is required".to_string());
+    }
+    let store = read_knowledge_store(&app_handle)?;
+    if !store.bases.iter().any(|base| base.id == knowledge_base_id) {
+        return Err(format!("knowledge base not found: {knowledge_base_id}"));
+    }
+
+    Ok(rank_retrieval_matches(
+        &store,
+        &knowledge_base_id,
+        &query_terms,
+    ))
+}
+
+#[tauri::command]
 fn list_system_logs() -> Result<Vec<LogEntry>, String> {
     Ok(vec![
         LogEntry {
@@ -1757,6 +1984,278 @@ fn current_load_duration_ms(engine: &State<'_, EngineRuntime>) -> Result<u64, St
 fn estimate_token_count(content: &str) -> u32 {
     let words = content.split_whitespace().count();
     u32::try_from(words.max(1)).unwrap_or(u32::MAX)
+}
+
+fn knowledge_store_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
+    app_handle
+        .path()
+        .app_config_dir()
+        .map(|path| path.join(KNOWLEDGE_STORE_FILE))
+        .map_err(|err| format!("failed to resolve knowledge store path: {err}"))
+}
+
+fn read_knowledge_store(app_handle: &AppHandle) -> Result<KnowledgeStore, String> {
+    let path = knowledge_store_path(app_handle)?;
+    if !path.exists() {
+        return Ok(KnowledgeStore::default());
+    }
+
+    let raw = fs::read_to_string(&path)
+        .map_err(|err| format!("failed to read knowledge store {}: {err}", path.display()))?;
+    if raw.trim().is_empty() {
+        return Ok(KnowledgeStore::default());
+    }
+
+    serde_json::from_str::<KnowledgeStore>(&raw)
+        .map_err(|err| format!("failed to parse knowledge store {}: {err}", path.display()))
+}
+
+fn write_knowledge_store(app_handle: &AppHandle, store: &KnowledgeStore) -> Result<(), String> {
+    let path = knowledge_store_path(app_handle)?;
+    let Some(directory) = path.parent() else {
+        return Err("knowledge store path has no parent directory".to_string());
+    };
+    fs::create_dir_all(directory).map_err(|err| {
+        format!(
+            "failed to create knowledge store directory {}: {err}",
+            directory.display()
+        )
+    })?;
+    let encoded = serde_json::to_string_pretty(store)
+        .map_err(|err| format!("failed to encode knowledge store: {err}"))?;
+    fs::write(&path, encoded)
+        .map_err(|err| format!("failed to write knowledge store {}: {err}", path.display()))
+}
+
+fn ensure_default_knowledge_base(store: &mut KnowledgeStore) {
+    if !store.bases.is_empty() {
+        return;
+    }
+
+    store.bases.push(KnowledgeBase {
+        id: "research-vault".to_string(),
+        name: "Research Vault".to_string(),
+        document_count: 0,
+        chunk_count: 0,
+        updated_at: unix_timestamp().to_string(),
+    });
+}
+
+fn unique_knowledge_base_id(store: &KnowledgeStore, name: &str) -> String {
+    let base = sanitize_identifier(name);
+    let base = if base.is_empty() {
+        "knowledge-base".to_string()
+    } else {
+        base
+    };
+    if !store.bases.iter().any(|candidate| candidate.id == base) {
+        return base;
+    }
+
+    let mut index = 2;
+    loop {
+        let candidate = format!("{base}-{index}");
+        if !store.bases.iter().any(|base| base.id == candidate) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+fn sort_knowledge_bases(store: &mut KnowledgeStore) {
+    store
+        .bases
+        .sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+}
+
+fn documents_for_base(store: &KnowledgeStore, knowledge_base_id: &str) -> Vec<KnowledgeDocument> {
+    let mut documents = store
+        .documents
+        .iter()
+        .filter(|document| document.knowledge_base_id == knowledge_base_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    documents.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    documents
+}
+
+fn knowledge_base_detail(
+    store: &KnowledgeStore,
+    knowledge_base_id: &str,
+) -> Result<KnowledgeBaseDetail, String> {
+    let base = store
+        .bases
+        .iter()
+        .find(|base| base.id == knowledge_base_id)
+        .cloned()
+        .ok_or_else(|| format!("knowledge base not found: {knowledge_base_id}"))?;
+    Ok(KnowledgeBaseDetail {
+        base,
+        documents: documents_for_base(store, knowledge_base_id),
+    })
+}
+
+fn refresh_knowledge_base_counts(store: &mut KnowledgeStore, knowledge_base_id: &str) {
+    let document_count = store
+        .documents
+        .iter()
+        .filter(|document| document.knowledge_base_id == knowledge_base_id)
+        .count() as u32;
+    let chunk_count = store
+        .chunks
+        .iter()
+        .filter(|chunk| chunk.knowledge_base_id == knowledge_base_id)
+        .count() as u32;
+    if let Some(base) = store
+        .bases
+        .iter_mut()
+        .find(|base| base.id == knowledge_base_id)
+    {
+        base.document_count = document_count;
+        base.chunk_count = chunk_count;
+        base.updated_at = unix_timestamp().to_string();
+    }
+}
+
+fn canonical_knowledge_document_path(path: &str) -> Result<PathBuf, String> {
+    let path = PathBuf::from(path.trim().trim_matches('"'));
+    if !path.exists() {
+        return Err(format!("document does not exist: {}", path.display()));
+    }
+    if !path.is_file() {
+        return Err(format!("document path is not a file: {}", path.display()));
+    }
+
+    path.canonicalize()
+        .map_err(|err| format!("failed to resolve document path {}: {err}", path.display()))
+}
+
+fn chunk_document_text(raw: &str) -> Vec<String> {
+    let normalized = raw
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if normalized.is_empty() {
+        return Vec::new();
+    }
+
+    let chars = normalized.chars().collect::<Vec<_>>();
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < chars.len() {
+        let mut end = (start + KNOWLEDGE_CHUNK_TARGET_CHARS).min(chars.len());
+        if end < chars.len() {
+            if let Some(boundary) = chars[start..end]
+                .iter()
+                .rposition(|ch| matches!(ch, '.' | '!' | '?' | '\n'))
+            {
+                end = (start + boundary + 1).max(start + 1);
+            }
+        }
+        let content = chars[start..end]
+            .iter()
+            .collect::<String>()
+            .trim()
+            .to_string();
+        if !content.is_empty() {
+            chunks.push(content);
+        }
+        if end >= chars.len() {
+            break;
+        }
+        start = end
+            .saturating_sub(KNOWLEDGE_CHUNK_OVERLAP_CHARS)
+            .max(start + 1);
+    }
+
+    chunks
+}
+
+fn tokenize_for_retrieval(input: &str) -> Vec<String> {
+    input
+        .split(|ch: char| !ch.is_alphanumeric())
+        .map(|token| token.trim().to_ascii_lowercase())
+        .filter(|token| token.len() >= 3)
+        .collect()
+}
+
+fn rank_retrieval_matches(
+    store: &KnowledgeStore,
+    knowledge_base_id: &str,
+    query_terms: &[String],
+) -> Vec<RetrievalMatch> {
+    let mut matches = store
+        .chunks
+        .iter()
+        .filter(|chunk| chunk.knowledge_base_id == knowledge_base_id)
+        .filter_map(|chunk| {
+            let chunk_terms = tokenize_for_retrieval(&chunk.content);
+            let score = retrieval_score(query_terms, &chunk_terms);
+            if score <= 0.0 {
+                return None;
+            }
+            Some(RetrievalMatch {
+                knowledge_base_id: chunk.knowledge_base_id.clone(),
+                document_id: chunk.document_id.clone(),
+                document_name: chunk.document_name.clone(),
+                chunk_index: chunk.chunk_index,
+                score,
+                snippet: retrieval_snippet(&chunk.content, query_terms),
+            })
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    matches.truncate(MAX_RETRIEVAL_RESULTS);
+
+    matches
+}
+
+fn retrieval_score(query_terms: &[String], chunk_terms: &[String]) -> f32 {
+    if query_terms.is_empty() || chunk_terms.is_empty() {
+        return 0.0;
+    }
+    let mut hits = 0_u32;
+    for query in query_terms {
+        if chunk_terms.iter().any(|term| term == query) {
+            hits += 2;
+        } else if chunk_terms.iter().any(|term| term.contains(query)) {
+            hits += 1;
+        }
+    }
+
+    hits as f32 / ((query_terms.len() as f32) * 2.0)
+}
+
+fn retrieval_snippet(content: &str, query_terms: &[String]) -> String {
+    let lower = content.to_ascii_lowercase();
+    let first_hit = query_terms
+        .iter()
+        .filter_map(|term| lower.find(term))
+        .min()
+        .unwrap_or(0);
+    let start = first_hit.saturating_sub(120);
+    let end = (first_hit + 360).min(content.len());
+    let mut snippet = content
+        .get(start..end)
+        .unwrap_or(content)
+        .replace('\n', " ")
+        .trim()
+        .to_string();
+    if start > 0 {
+        snippet.insert_str(0, "...");
+    }
+    if end < content.len() {
+        snippet.push_str("...");
+    }
+
+    snippet
 }
 
 fn seed_default_profiles(directory: &Path) -> Result<(), String> {
@@ -4007,6 +4506,40 @@ mod tests {
     }
 
     #[test]
+    fn chunks_and_ranks_knowledge_retrieval() {
+        let chunks = chunk_document_text(
+            "GPU offload moves transformer layers into VRAM.\n\nContext windows increase KV cache pressure.",
+        );
+        assert_eq!(chunks.len(), 1);
+
+        let store = KnowledgeStore {
+            bases: vec![KnowledgeBase {
+                id: "research-vault".to_string(),
+                name: "Research Vault".to_string(),
+                document_count: 1,
+                chunk_count: 1,
+                updated_at: "test".to_string(),
+            }],
+            documents: Vec::new(),
+            chunks: vec![KnowledgeChunk {
+                id: "chunk-1".to_string(),
+                knowledge_base_id: "research-vault".to_string(),
+                document_id: "doc-1".to_string(),
+                document_name: "notes.md".to_string(),
+                chunk_index: 0,
+                content: chunks[0].clone(),
+            }],
+        };
+        let query_terms = tokenize_for_retrieval("VRAM context cache");
+        let matches = rank_retrieval_matches(&store, "research-vault", &query_terms);
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].document_name, "notes.md");
+        assert!(matches[0].score > 0.6);
+        assert!(matches[0].snippet.contains("VRAM"));
+    }
+
+    #[test]
     fn parses_split_openai_sse_chat_deltas() {
         let mut buffer = Vec::new();
         let mut deltas = Vec::new();
@@ -4154,6 +4687,11 @@ pub fn run() {
             get_api_status,
             run_benchmark,
             list_benchmark_results,
+            list_knowledge_bases,
+            create_knowledge_base,
+            list_knowledge_documents,
+            import_knowledge_document,
+            test_knowledge_retrieval,
             list_system_logs
         ])
         .run(tauri::generate_context!())
