@@ -63,6 +63,91 @@ export interface ModelRecord {
   fit: string;
 }
 
+export interface SamplingParameters {
+  temperature: number;
+  topP: number;
+  topK: number;
+  minP: number;
+  typicalP: number;
+  repeatPenalty: number;
+  repeatLastN: number;
+  presencePenalty: number;
+  frequencyPenalty: number;
+  mirostatMode: number;
+  mirostatTau: number;
+  mirostatEta: number;
+  seed: number | null;
+  maxTokens: number;
+  stopSequences: string[];
+}
+
+export interface RuntimeParameters {
+  backend: string;
+  contextLength: number;
+  batchSize: number;
+  microBatchSize: number;
+  cpuThreads: number;
+  gpuLayers: number;
+  tensorSplit: number[];
+  mainGpu: number | null;
+  useMmap: boolean;
+  useMlock: boolean;
+  flashAttention: boolean;
+  kvCacheQuantization: string;
+  ropeFrequencyBase: number | null;
+  ropeFrequencyScale: number | null;
+}
+
+export interface LogitBiasEntry {
+  token: string;
+  bias: number;
+}
+
+export interface OutputConstraints {
+  mode: string;
+  jsonSchema: string;
+  grammar: string;
+  logitBias: LogitBiasEntry[];
+  logprobs: boolean;
+  topLogprobs: number;
+}
+
+export interface InferenceProfile {
+  id: string;
+  name: string;
+  description: string;
+  systemPrompt: string;
+  sampling: SamplingParameters;
+  runtime: RuntimeParameters;
+  output: OutputConstraints;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface LoadPlanSegment {
+  label: string;
+  gib: number;
+  color: string;
+}
+
+export interface ModelLoadPlan {
+  modelId: string;
+  profileId: string;
+  backend: string;
+  fit: string;
+  recommendation: string;
+  estimatedLayers: number;
+  gpuLayers: number;
+  cpuLayers: number;
+  modelWeightsGib: number;
+  kvCacheGib: number;
+  runtimeOverheadGib: number;
+  totalRequiredGib: number;
+  ramTotalGib: number;
+  ramAvailableGib: number;
+  segments: LoadPlanSegment[];
+}
+
 export interface ApiEndpoint {
   method: string;
   path: string;

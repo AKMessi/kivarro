@@ -39,19 +39,25 @@
     Zap,
   } from "@lucide/svelte";
   import {
+    fallbackProfiles,
     getApiStatus,
     getHardwareSnapshot,
+    getModelLoadPlan,
     getRuntimeMetrics,
     listBenchmarkResults,
+    listInferenceProfiles,
     listModels,
     listSystemLogs,
+    saveInferenceProfile,
   } from "$lib/api";
   import type {
     ApiStatus,
     BenchmarkResult,
     HardwareSnapshot,
+    InferenceProfile,
     LogEntry,
     ModelRecord,
+    ModelLoadPlan,
     RuntimeMetrics,
     ViewId,
   } from "$lib/types";
@@ -89,13 +95,6 @@
     { title: "Previous 7 Days", items: ["Long context summary", "RAG retrieval audit"] },
   ];
 
-  const promptProfiles = [
-    "Balanced Engineer",
-    "Strict JSON Extractor",
-    "Local Code Reviewer",
-    "Long Context Analyst",
-  ];
-
   const knowledgeBases = ["Research Vault", "Codebase Memory", "Paper Notes"];
   const agentTools = [
     { name: "Local terminal", enabled: false, danger: true },
@@ -111,29 +110,22 @@
   let commandPaletteOpen = false;
   let splitView = false;
   let promptText = "";
-  let selectedProfile = promptProfiles[0];
+  let selectedProfileId = fallbackProfiles[0].id;
+  let selectedModelId = "";
   let modelFilter = "";
   let logFilter = "ALL";
+  let profileSaveStatus = "Synced";
 
   let hardware: HardwareSnapshot | null = null;
   let metrics: RuntimeMetrics | null = null;
   let models: ModelRecord[] = [];
+  let profiles: InferenceProfile[] = fallbackProfiles;
+  let loadPlan: ModelLoadPlan | null = null;
   let apiStatus: ApiStatus | null = null;
   let benchmarks: BenchmarkResult[] = [];
   let logs: LogEntry[] = [];
 
-  let sampling = {
-    temperature: 0.7,
-    topP: 0.92,
-    topK: 40,
-    minP: 0.05,
-    repeatPenalty: 1.1,
-    presencePenalty: 0,
-    frequencyPenalty: 0,
-    maxTokens: 2048,
-    gpuLayers: 0,
-    contextLength: 32768,
-  };
+  let sampling = controlsFromProfile(fallbackProfiles[0]);
 
   const chatMessages: ChatMessage[] = [
     {
@@ -154,6 +146,9 @@
   ];
 
   $: activeMeta = navItems.find((item) => item.id === activeView) ?? navItems[0];
+  $: activeProfile =
+    profiles.find((profile) => profile.id === selectedProfileId) ?? profiles[0] ?? fallbackProfiles[0];
+  $: selectedModel = models.find((model) => model.id === selectedModelId) ?? models[0] ?? null;
   $: contextPercent = metrics
     ? clamp((metrics.contextUsedTokens / metrics.contextTotalTokens) * 100, 0, 100)
     : 0;
@@ -184,11 +179,12 @@
   });
 
   async function hydrate() {
-    const [nextHardware, nextMetrics, nextModels, nextApiStatus, nextBenchmarks, nextLogs] =
+    const [nextHardware, nextMetrics, nextModels, nextProfiles, nextApiStatus, nextBenchmarks, nextLogs] =
       await Promise.all([
         getHardwareSnapshot(),
         getRuntimeMetrics(),
         listModels(),
+        listInferenceProfiles(),
         getApiStatus(),
         listBenchmarkResults(),
         listSystemLogs(),
@@ -197,9 +193,14 @@
     hardware = nextHardware;
     metrics = nextMetrics;
     models = nextModels;
+    profiles = nextProfiles.length > 0 ? nextProfiles : fallbackProfiles;
+    selectedProfileId = profiles[0]?.id ?? fallbackProfiles[0].id;
+    sampling = controlsFromProfile(profiles[0] ?? fallbackProfiles[0]);
+    selectedModelId = nextModels[0]?.id ?? "";
     apiStatus = nextApiStatus;
     benchmarks = nextBenchmarks;
     logs = nextLogs;
+    await updateLoadPlan();
   }
 
   async function refreshRuntime() {
@@ -209,6 +210,42 @@
   function setActiveView(view: ViewId) {
     activeView = view;
     commandPaletteOpen = false;
+  }
+
+  function selectProfile(profileId: string) {
+    const profile = profiles.find((candidate) => candidate.id === profileId);
+    if (!profile) return;
+
+    selectedProfileId = profile.id;
+    sampling = controlsFromProfile(profile);
+    profileSaveStatus = "Loaded";
+    void updateLoadPlan(profile);
+  }
+
+  function selectModel(modelId: string) {
+    selectedModelId = modelId;
+    void updateLoadPlan();
+  }
+
+  async function updateLoadPlan(profile = buildProfileFromControls()) {
+    if (!selectedModelId) {
+      loadPlan = null;
+      return;
+    }
+
+    loadPlan = await getModelLoadPlan(selectedModelId, profile);
+  }
+
+  async function saveCurrentProfile() {
+    profileSaveStatus = "Saving";
+    const savedProfile = await saveInferenceProfile(buildProfileFromControls());
+    profiles = [
+      savedProfile,
+      ...profiles.filter((profile) => profile.id !== savedProfile.id),
+    ].sort((left, right) => left.name.localeCompare(right.name));
+    selectedProfileId = savedProfile.id;
+    profileSaveStatus = "Saved";
+    void updateLoadPlan(savedProfile);
   }
 
   function toggleTheme() {
@@ -250,6 +287,83 @@
 
   function formatTokens(value: number) {
     return new Intl.NumberFormat("en-US").format(value);
+  }
+
+  function controlsFromProfile(profile: InferenceProfile) {
+    return {
+      temperature: profile.sampling.temperature,
+      topP: profile.sampling.topP,
+      topK: profile.sampling.topK,
+      minP: profile.sampling.minP,
+      typicalP: profile.sampling.typicalP,
+      repeatPenalty: profile.sampling.repeatPenalty,
+      repeatLastN: profile.sampling.repeatLastN,
+      presencePenalty: profile.sampling.presencePenalty,
+      frequencyPenalty: profile.sampling.frequencyPenalty,
+      mirostatMode: profile.sampling.mirostatMode,
+      mirostatTau: profile.sampling.mirostatTau,
+      mirostatEta: profile.sampling.mirostatEta,
+      seed: profile.sampling.seed,
+      maxTokens: profile.sampling.maxTokens,
+      stopSequences: [...profile.sampling.stopSequences],
+      backend: profile.runtime.backend,
+      contextLength: profile.runtime.contextLength,
+      batchSize: profile.runtime.batchSize,
+      microBatchSize: profile.runtime.microBatchSize,
+      cpuThreads: profile.runtime.cpuThreads,
+      gpuLayers: profile.runtime.gpuLayers,
+      tensorSplit: [...profile.runtime.tensorSplit],
+      mainGpu: profile.runtime.mainGpu,
+      useMmap: profile.runtime.useMmap,
+      useMlock: profile.runtime.useMlock,
+      flashAttention: profile.runtime.flashAttention,
+      kvCacheQuantization: profile.runtime.kvCacheQuantization,
+      ropeFrequencyBase: profile.runtime.ropeFrequencyBase,
+      ropeFrequencyScale: profile.runtime.ropeFrequencyScale,
+    };
+  }
+
+  function buildProfileFromControls(): InferenceProfile {
+    return {
+      ...activeProfile,
+      sampling: {
+        ...activeProfile.sampling,
+        temperature: Number(sampling.temperature),
+        topP: Number(sampling.topP),
+        topK: Number(sampling.topK),
+        minP: Number(sampling.minP),
+        typicalP: Number(sampling.typicalP),
+        repeatPenalty: Number(sampling.repeatPenalty),
+        repeatLastN: Number(sampling.repeatLastN),
+        presencePenalty: Number(sampling.presencePenalty),
+        frequencyPenalty: Number(sampling.frequencyPenalty),
+        mirostatMode: Number(sampling.mirostatMode),
+        mirostatTau: Number(sampling.mirostatTau),
+        mirostatEta: Number(sampling.mirostatEta),
+        seed: sampling.seed === null ? null : Number(sampling.seed),
+        maxTokens: Number(sampling.maxTokens),
+        stopSequences: [...sampling.stopSequences],
+      },
+      runtime: {
+        ...activeProfile.runtime,
+        backend: sampling.backend,
+        contextLength: Number(sampling.contextLength),
+        batchSize: Number(sampling.batchSize),
+        microBatchSize: Number(sampling.microBatchSize),
+        cpuThreads: Number(sampling.cpuThreads),
+        gpuLayers: Number(sampling.gpuLayers),
+        tensorSplit: [...sampling.tensorSplit],
+        mainGpu: sampling.mainGpu === null ? null : Number(sampling.mainGpu),
+        useMmap: Boolean(sampling.useMmap),
+        useMlock: Boolean(sampling.useMlock),
+        flashAttention: Boolean(sampling.flashAttention),
+        kvCacheQuantization: sampling.kvCacheQuantization,
+        ropeFrequencyBase:
+          sampling.ropeFrequencyBase === null ? null : Number(sampling.ropeFrequencyBase),
+        ropeFrequencyScale:
+          sampling.ropeFrequencyScale === null ? null : Number(sampling.ropeFrequencyScale),
+      },
+    };
   }
 </script>
 
@@ -330,11 +444,17 @@
       {#if activeView === "command"}
         <div class="profile-select">
           <label for="profile">Prompt profile</label>
-          <select id="profile" bind:value={selectedProfile}>
-            {#each promptProfiles as profile}
-              <option value={profile}>{profile}</option>
+          <select
+            id="profile"
+            bind:value={selectedProfileId}
+            onchange={(event) => selectProfile(event.currentTarget.value)}
+          >
+            {#each profiles as profile}
+              <option value={profile.id}>{profile.name}</option>
             {/each}
           </select>
+          <p class="profile-description">{activeProfile.description}</p>
+          <code>{activeProfile.id}.kivarro.json</code>
         </div>
         <div class="section-label">Chats</div>
         {#each chatHistory as group}
@@ -359,7 +479,7 @@
           <p class="muted-copy">No models found in ./models yet.</p>
         {:else}
           {#each filteredModels as model}
-            <button class="model-mini">
+            <button class:active={selectedModelId === model.id} class="model-mini" onclick={() => selectModel(model.id)}>
               <span>{model.name}</span>
               <small>{model.format} / {formatNumber(model.sizeGib)} GiB</small>
             </button>
@@ -507,14 +627,55 @@
               <span>Status</span>
             </div>
             {#each filteredModels as model}
-              <div class="table-row">
+              <button
+                class:active={selectedModelId === model.id}
+                class="table-row model-row"
+                onclick={() => selectModel(model.id)}
+              >
                 <span>{model.name}</span>
                 <code>{model.format}</code>
                 <code>{formatNumber(model.sizeGib)} GiB</code>
                 <span class:good={model.fit === "Fits"} class:warn={model.fit !== "Fits"}>{model.fit}</span>
                 <span>{model.status}</span>
-              </div>
+              </button>
             {/each}
+          </section>
+        {/if}
+
+        {#if loadPlan}
+          <section class="load-plan">
+            <div class="panel-header inline">
+              <span>Load plan / {selectedModel?.name ?? "selected model"}</span>
+              <code>{loadPlan.backend}</code>
+            </div>
+            <div class="load-plan-grid">
+              <div>
+                <span>Fit</span>
+                <strong>{loadPlan.fit}</strong>
+              </div>
+              <div>
+                <span>Layers</span>
+                <strong>{loadPlan.gpuLayers} GPU / {loadPlan.cpuLayers} CPU</strong>
+              </div>
+              <div>
+                <span>Total required</span>
+                <strong>{formatNumber(loadPlan.totalRequiredGib)} GiB</strong>
+              </div>
+              <div>
+                <span>Available RAM</span>
+                <strong>{formatNumber(loadPlan.ramAvailableGib)} GiB</strong>
+              </div>
+            </div>
+            <div class="segment-bar">
+              {#each loadPlan.segments.slice(0, 3) as segment}
+                <span
+                  class={`segment-${segment.color}`}
+                  style={`width: ${(segment.gib / Math.max(loadPlan.totalRequiredGib, 1)) * 100}%`}
+                  title={`${segment.label}: ${formatNumber(segment.gib)} GiB`}
+                ></span>
+              {/each}
+            </div>
+            <p>{loadPlan.recommendation}</p>
           </section>
         {/if}
       {:else if activeView === "hardware"}
@@ -551,25 +712,76 @@
         <section class="control-band">
           <div>
             <label for="gpu-layers">GPU offload layers</label>
-            <input id="gpu-layers" type="range" min="0" max="96" step="1" bind:value={sampling.gpuLayers} />
-            <code>{sampling.gpuLayers} layers / estimated VRAM adapter pending</code>
+            <input
+              id="gpu-layers"
+              type="range"
+              min="0"
+              max={loadPlan?.estimatedLayers ?? 96}
+              step="1"
+              bind:value={sampling.gpuLayers}
+              onchange={() => void updateLoadPlan()}
+            />
+            <code>{sampling.gpuLayers} layers / {loadPlan?.estimatedLayers ?? 96} estimated</code>
           </div>
           <div>
             <label for="context-length">Context length</label>
-            <input id="context-length" type="range" min="4096" max="262144" step="4096" bind:value={sampling.contextLength} />
+            <input
+              id="context-length"
+              type="range"
+              min="4096"
+              max="262144"
+              step="4096"
+              bind:value={sampling.contextLength}
+              onchange={() => void updateLoadPlan()}
+            />
             <code>{formatTokens(sampling.contextLength)} tokens</code>
           </div>
         </section>
+
+        {#if loadPlan}
+          <section class="hardware-plan">
+            <div class="panel-header inline">
+              <span>Simulated allocation</span>
+              <code>{loadPlan.fit}</code>
+            </div>
+            <div class="allocation-grid">
+              {#each loadPlan.segments as segment}
+                <div>
+                  <span>{segment.label}</span>
+                  <strong>{formatNumber(segment.gib)} GiB</strong>
+                </div>
+              {/each}
+            </div>
+            <div class="segment-bar large">
+              {#each loadPlan.segments.slice(0, 3) as segment}
+                <span
+                  class={`segment-${segment.color}`}
+                  style={`width: ${(segment.gib / Math.max(loadPlan.totalRequiredGib, 1)) * 100}%`}
+                ></span>
+              {/each}
+            </div>
+            <p>{loadPlan.recommendation}</p>
+          </section>
+        {/if}
       {:else if activeView === "tuning"}
         <section class="workspace-header">
           <div>
             <p class="eyebrow">Expert Tuning</p>
             <h1>Reusable inference profile</h1>
           </div>
-          <button class="primary-button">
+          <button class="primary-button" onclick={saveCurrentProfile}>
             <Clipboard size={15} />
             Save .kivarro.json
           </button>
+        </section>
+
+        <section class="profile-strip">
+          <div>
+            <span>Active profile</span>
+            <strong>{activeProfile.name}</strong>
+            <code>{profileSaveStatus}</code>
+          </div>
+          <p>{activeProfile.description}</p>
         </section>
 
         <section class="tuning-grid">
@@ -579,7 +791,9 @@
               ["Top P", "topP", 0, 1, 0.01],
               ["Top K", "topK", 0, 200, 1],
               ["Min P", "minP", 0, 1, 0.01],
+              ["Typical P", "typicalP", 0, 1, 0.01],
               ["Repeat Penalty", "repeatPenalty", 0.8, 2, 0.01],
+              ["Repeat Last N", "repeatLastN", -1, 4096, 1],
               ["Presence Penalty", "presencePenalty", -2, 2, 0.01],
               ["Frequency Penalty", "frequencyPenalty", -2, 2, 0.01],
             ] as control}
@@ -608,6 +822,57 @@
               {/each}
             </div>
           </div>
+        </section>
+
+        <section class="runtime-grid">
+          <label>
+            <span>Backend</span>
+            <select bind:value={sampling.backend}>
+              <option value="llama.cpp">llama.cpp</option>
+              <option value="mistral.rs">mistral.rs</option>
+            </select>
+          </label>
+          <label>
+            <span>KV cache</span>
+            <select bind:value={sampling.kvCacheQuantization} onchange={() => void updateLoadPlan()}>
+              <option value="f16">f16</option>
+              <option value="q8_0">q8_0</option>
+              <option value="q4_0">q4_0</option>
+              <option value="f32">f32</option>
+            </select>
+          </label>
+          <label>
+            <span>Batch</span>
+            <input type="number" min="1" step="1" bind:value={sampling.batchSize} />
+          </label>
+          <label>
+            <span>Micro batch</span>
+            <input type="number" min="1" step="1" bind:value={sampling.microBatchSize} />
+          </label>
+          <label>
+            <span>CPU threads</span>
+            <input type="number" min="1" step="1" bind:value={sampling.cpuThreads} />
+          </label>
+          <label>
+            <span>Mirostat</span>
+            <select bind:value={sampling.mirostatMode}>
+              <option value={0}>Off</option>
+              <option value={1}>v1</option>
+              <option value={2}>v2</option>
+            </select>
+          </label>
+          <label class="toggle-line">
+            <span>mmap</span>
+            <input type="checkbox" bind:checked={sampling.useMmap} />
+          </label>
+          <label class="toggle-line">
+            <span>mlock</span>
+            <input type="checkbox" bind:checked={sampling.useMlock} />
+          </label>
+          <label class="toggle-line">
+            <span>Flash Attention</span>
+            <input type="checkbox" bind:checked={sampling.flashAttention} />
+          </label>
         </section>
 
         <section class="schema-editor">
@@ -804,6 +1069,15 @@
       </div>
 
       <section class="inspector-section">
+        <div class="section-label">Active Profile</div>
+        <div class="stat-row">
+          <span>{activeProfile.name}</span>
+          <code>{profileSaveStatus}</code>
+        </div>
+        <button class="inspector-action" onclick={saveCurrentProfile}>Save profile</button>
+      </section>
+
+      <section class="inspector-section">
         <div class="section-label">Run Parameters</div>
         <label>
           Temperature
@@ -816,6 +1090,15 @@
         <label>
           Max tokens
           <input type="number" min="1" max="65536" step="1" bind:value={sampling.maxTokens} />
+        </label>
+        <label>
+          KV cache
+          <select bind:value={sampling.kvCacheQuantization} onchange={() => void updateLoadPlan()}>
+            <option value="f16">f16</option>
+            <option value="q8_0">q8_0</option>
+            <option value="q4_0">q4_0</option>
+            <option value="f32">f32</option>
+          </select>
         </label>
       </section>
 
@@ -842,6 +1125,12 @@
           <span>RAM</span>
           <code>{formatNumber(metrics?.ramUsedGib ?? 0)} / {formatNumber(metrics?.ramTotalGib ?? 0)} GiB</code>
         </div>
+        {#if loadPlan}
+          <div class="stat-row">
+            <span>Load plan</span>
+            <code>{formatNumber(loadPlan.totalRequiredGib)} GiB</code>
+          </div>
+        {/if}
       </section>
     </aside>
   </div>
@@ -1185,10 +1474,23 @@
     padding: 8px;
   }
 
+  .model-mini.active,
+  .model-row.active {
+    border-color: color-mix(in srgb, var(--cyan) 42%, var(--border));
+    background: color-mix(in srgb, var(--cyan) 10%, var(--panel-2));
+    color: var(--text);
+  }
+
   .model-mini small,
-  .muted-copy {
+  .muted-copy,
+  .profile-description {
     color: var(--dim);
     font-size: 12px;
+  }
+
+  .profile-description {
+    margin: 0;
+    line-height: 1.45;
   }
 
   .metric-stack > div {
@@ -1311,8 +1613,12 @@
 
   .chat-pane,
   .model-table,
+  .load-plan,
   .compute-block,
   .control-band,
+  .hardware-plan,
+  .profile-strip,
+  .runtime-grid,
   .distribution-panel,
   .schema-editor > div,
   .rag-grid article,
@@ -1500,6 +1806,21 @@
     font-size: 13px;
   }
 
+  .model-row {
+    width: 100%;
+    border-left: 0;
+    border-right: 0;
+    border-top: 0;
+    color: var(--text);
+    text-align: left;
+    background: transparent;
+    cursor: pointer;
+  }
+
+  .model-row:hover {
+    background: var(--panel-2);
+  }
+
   .table-row.header {
     color: var(--dim);
     font-size: 11px;
@@ -1567,6 +1888,110 @@
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 16px;
     padding: 14px;
+  }
+
+  .load-plan,
+  .hardware-plan,
+  .profile-strip,
+  .runtime-grid {
+    padding: 14px;
+  }
+
+  .load-plan p,
+  .hardware-plan p,
+  .profile-strip p {
+    margin: 10px 0 0;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.5;
+  }
+
+  .load-plan-grid,
+  .allocation-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 10px;
+  }
+
+  .load-plan-grid div,
+  .allocation-grid div,
+  .profile-strip div {
+    display: grid;
+    gap: 4px;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: var(--panel-2);
+  }
+
+  .load-plan-grid span,
+  .allocation-grid span,
+  .profile-strip span {
+    color: var(--dim);
+    font-size: 11px;
+    font-weight: 800;
+    text-transform: uppercase;
+  }
+
+  .segment-bar {
+    height: 12px;
+    display: flex;
+    overflow: hidden;
+    margin-top: 12px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--panel-2);
+  }
+
+  .segment-bar.large {
+    height: 16px;
+  }
+
+  .segment-bar span {
+    min-width: 4px;
+  }
+
+  .segment-amber {
+    background: var(--amber);
+  }
+
+  .segment-cyan {
+    background: var(--cyan);
+  }
+
+  .segment-magenta {
+    background: var(--magenta);
+  }
+
+  .segment-green {
+    background: var(--green);
+  }
+
+  .runtime-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 10px;
+  }
+
+  .runtime-grid label {
+    display: grid;
+    gap: 8px;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--panel);
+    text-transform: none;
+  }
+
+  .runtime-grid .toggle-line {
+    grid-template-columns: minmax(0, 1fr) 24px;
+    align-items: center;
+  }
+
+  .runtime-grid input[type="checkbox"] {
+    width: 18px;
+    height: 18px;
+    accent-color: var(--amber);
   }
 
   .control-band > div,
@@ -1837,6 +2262,15 @@
     text-transform: none;
   }
 
+  .inspector-action {
+    height: 30px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: #0e0e11;
+    background: var(--amber);
+    cursor: pointer;
+  }
+
   .mini-bar {
     height: 8px;
     margin-top: 10px;
@@ -1962,7 +2396,10 @@
     .rag-grid,
     .agent-canvas,
     .settings-grid,
-    .tool-permissions {
+    .tool-permissions,
+    .load-plan-grid,
+    .allocation-grid,
+    .runtime-grid {
       grid-template-columns: 1fr;
     }
 

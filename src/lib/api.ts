@@ -3,8 +3,10 @@ import type {
   ApiStatus,
   BenchmarkResult,
   HardwareSnapshot,
+  InferenceProfile,
   LogEntry,
   ModelRecord,
+  ModelLoadPlan,
   RuntimeMetrics,
 } from "./types";
 
@@ -65,13 +67,216 @@ const fallbackApiStatus: ApiStatus = {
   ],
 };
 
-async function safeInvoke<T>(command: string, fallback: T): Promise<T> {
+export const fallbackProfiles: InferenceProfile[] = [
+  {
+    id: "balanced-engineer",
+    name: "Balanced Engineer",
+    description: "General technical work with stable sampling and long-context defaults.",
+    systemPrompt:
+      "You are a precise local AI assistant. Prefer concise, verifiable answers and surface uncertainty explicitly.",
+    sampling: {
+      temperature: 0.7,
+      topP: 0.92,
+      topK: 40,
+      minP: 0.05,
+      typicalP: 1,
+      repeatPenalty: 1.1,
+      repeatLastN: 256,
+      presencePenalty: 0,
+      frequencyPenalty: 0,
+      mirostatMode: 0,
+      mirostatTau: 5,
+      mirostatEta: 0.1,
+      seed: null,
+      maxTokens: 2048,
+      stopSequences: [],
+    },
+    runtime: {
+      backend: "llama.cpp",
+      contextLength: 32768,
+      batchSize: 512,
+      microBatchSize: 128,
+      cpuThreads: 4,
+      gpuLayers: 0,
+      tensorSplit: [],
+      mainGpu: null,
+      useMmap: true,
+      useMlock: false,
+      flashAttention: true,
+      kvCacheQuantization: "f16",
+      ropeFrequencyBase: null,
+      ropeFrequencyScale: null,
+    },
+    output: {
+      mode: "text",
+      jsonSchema: "",
+      grammar: "",
+      logitBias: [],
+      logprobs: false,
+      topLogprobs: 0,
+    },
+    createdAt: "preview",
+    updatedAt: "preview",
+  },
+  {
+    id: "strict-json-extractor",
+    name: "Strict JSON Extractor",
+    description: "Low-temperature extraction profile with JSON schema constraints ready.",
+    systemPrompt: "Return only valid JSON that satisfies the active schema. Do not include prose.",
+    sampling: {
+      temperature: 0.1,
+      topP: 0.85,
+      topK: 20,
+      minP: 0.01,
+      typicalP: 1,
+      repeatPenalty: 1.05,
+      repeatLastN: 128,
+      presencePenalty: 0,
+      frequencyPenalty: 0,
+      mirostatMode: 0,
+      mirostatTau: 5,
+      mirostatEta: 0.1,
+      seed: 42,
+      maxTokens: 2048,
+      stopSequences: [],
+    },
+    runtime: {
+      backend: "llama.cpp",
+      contextLength: 16384,
+      batchSize: 512,
+      microBatchSize: 128,
+      cpuThreads: 4,
+      gpuLayers: 0,
+      tensorSplit: [],
+      mainGpu: null,
+      useMmap: true,
+      useMlock: false,
+      flashAttention: true,
+      kvCacheQuantization: "f16",
+      ropeFrequencyBase: null,
+      ropeFrequencyScale: null,
+    },
+    output: {
+      mode: "json_schema",
+      jsonSchema:
+        '{\n  "type": "object",\n  "properties": {},\n  "additionalProperties": true\n}',
+      grammar: "",
+      logitBias: [],
+      logprobs: false,
+      topLogprobs: 0,
+    },
+    createdAt: "preview",
+    updatedAt: "preview",
+  },
+  {
+    id: "local-code-reviewer",
+    name: "Local Code Reviewer",
+    description: "Deterministic review profile tuned for code, diffs, and concrete findings.",
+    systemPrompt:
+      "Review code for correctness, regressions, security issues, and missing tests. Lead with actionable findings.",
+    sampling: {
+      temperature: 0.25,
+      topP: 0.9,
+      topK: 40,
+      minP: 0.03,
+      typicalP: 1,
+      repeatPenalty: 1.08,
+      repeatLastN: 256,
+      presencePenalty: 0,
+      frequencyPenalty: 0,
+      mirostatMode: 0,
+      mirostatTau: 5,
+      mirostatEta: 0.1,
+      seed: null,
+      maxTokens: 4096,
+      stopSequences: [],
+    },
+    runtime: {
+      backend: "llama.cpp",
+      contextLength: 65536,
+      batchSize: 1024,
+      microBatchSize: 256,
+      cpuThreads: 4,
+      gpuLayers: 0,
+      tensorSplit: [],
+      mainGpu: null,
+      useMmap: true,
+      useMlock: false,
+      flashAttention: true,
+      kvCacheQuantization: "q8_0",
+      ropeFrequencyBase: null,
+      ropeFrequencyScale: null,
+    },
+    output: {
+      mode: "text",
+      jsonSchema: "",
+      grammar: "",
+      logitBias: [],
+      logprobs: true,
+      topLogprobs: 5,
+    },
+    createdAt: "preview",
+    updatedAt: "preview",
+  },
+  {
+    id: "long-context-analyst",
+    name: "Long Context Analyst",
+    description: "Large-context analysis with compressed KV cache and conservative decoding.",
+    systemPrompt:
+      "Analyze long context carefully. Track assumptions, cite relevant sections, and avoid inventing missing facts.",
+    sampling: {
+      temperature: 0.35,
+      topP: 0.9,
+      topK: 30,
+      minP: 0.02,
+      typicalP: 1,
+      repeatPenalty: 1.12,
+      repeatLastN: 512,
+      presencePenalty: 0,
+      frequencyPenalty: 0.1,
+      mirostatMode: 0,
+      mirostatTau: 5,
+      mirostatEta: 0.1,
+      seed: null,
+      maxTokens: 8192,
+      stopSequences: [],
+    },
+    runtime: {
+      backend: "llama.cpp",
+      contextLength: 131072,
+      batchSize: 1024,
+      microBatchSize: 256,
+      cpuThreads: 4,
+      gpuLayers: 0,
+      tensorSplit: [],
+      mainGpu: null,
+      useMmap: true,
+      useMlock: false,
+      flashAttention: true,
+      kvCacheQuantization: "q4_0",
+      ropeFrequencyBase: null,
+      ropeFrequencyScale: null,
+    },
+    output: {
+      mode: "text",
+      jsonSchema: "",
+      grammar: "",
+      logitBias: [],
+      logprobs: false,
+      topLogprobs: 0,
+    },
+    createdAt: "preview",
+    updatedAt: "preview",
+  },
+];
+
+async function safeInvoke<T>(command: string, fallback: T, args?: Record<string, unknown>): Promise<T> {
   if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) {
     return fallback;
   }
 
   try {
-    return await invoke<T>(command);
+    return await invoke<T>(command, args);
   } catch (error) {
     console.warn(`Kivarro command failed: ${command}`, error);
     return fallback;
@@ -88,6 +293,25 @@ export function getRuntimeMetrics(): Promise<RuntimeMetrics> {
 
 export function listModels(): Promise<ModelRecord[]> {
   return safeInvoke("list_models", []);
+}
+
+export function listInferenceProfiles(): Promise<InferenceProfile[]> {
+  return safeInvoke("list_inference_profiles", fallbackProfiles);
+}
+
+export function saveInferenceProfile(profile: InferenceProfile): Promise<InferenceProfile> {
+  return safeInvoke("save_inference_profile", profile, { profile });
+}
+
+export function deleteInferenceProfile(id: string): Promise<void> {
+  return safeInvoke("delete_inference_profile", undefined, { id });
+}
+
+export function getModelLoadPlan(
+  modelId: string,
+  profile: InferenceProfile,
+): Promise<ModelLoadPlan | null> {
+  return safeInvoke<ModelLoadPlan | null>("get_model_load_plan", null, { modelId, profile });
 }
 
 export function getApiStatus(): Promise<ApiStatus> {

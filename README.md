@@ -8,6 +8,9 @@ Kivarro is a Rust/Tauri local model inference workstation for Windows, macOS, an
 - Custom Kivarro application shell with nav rail, contextual panel, workspace, inspector, and status bar.
 - Implemented views for Command Center, Model Registry, Hardware Fit, Expert Tuning, RAG Knowledge Bases, Agents, Local API, Benchmarks, Logs, and Settings.
 - Rust commands for CPU/RAM telemetry, local model discovery under `./models`, API endpoint metadata, logs, and benchmark result surfaces.
+- Persistent `.kivarro.json` inference profiles stored in the app config directory.
+- Profile-backed tuning controls for sampling, runtime, KV cache precision, context length, batching, mmap/mlock, and Flash Attention.
+- Model load-plan estimator for RAM pressure, KV cache allocation, runtime overhead, and GPU/CPU layer split.
 - Browser-preview fallbacks for UI smoke testing outside Tauri.
 - Windows ARM64 release bundling verified with MSI and NSIS outputs.
 
@@ -38,6 +41,17 @@ npm run preview -- --host 127.0.0.1 --port 4173
 ## Model files
 
 Place local model files under `./models`. The baseline scanner currently recognizes `.gguf`, `.safetensors`, `.bin`, and `.mlx` files.
+
+## Profiles
+
+Kivarro seeds four default profiles on first launch:
+
+- Balanced Engineer
+- Strict JSON Extractor
+- Local Code Reviewer
+- Long Context Analyst
+
+Profiles are saved as `.kivarro.json` files through the Tauri backend. The profile schema includes system prompt, sampling controls, runtime controls, and output constraints.
 
 ## Next engineering milestones
 
