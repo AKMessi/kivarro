@@ -53,8 +53,8 @@
     listSystemLogs,
     runChatCompletionStream,
     saveInferenceProfile,
-    startLlamaServer,
-    stopLlamaServer,
+    startInferenceEngine,
+    stopInferenceEngine,
   } from "$lib/api";
   import type {
     ApiStatus,
@@ -328,14 +328,15 @@
 
   async function startSelectedModel() {
     if (!selectedModelId || !selectedModel) {
-      engineNotice = "Select a GGUF model before loading.";
+      engineNotice = "Select a local model before loading.";
       return;
     }
 
+    const profile = buildProfileFromControls();
     engineBusy = true;
-    engineNotice = `Starting llama-server for ${selectedModel.name}`;
+    engineNotice = `Starting ${profile.runtime.backend} for ${selectedModel.name}`;
     try {
-      engineStatus = await startLlamaServer(selectedModelId, buildProfileFromControls());
+      engineStatus = await startInferenceEngine(selectedModelId, profile);
       engineNotice = engineStatus.message;
       const [nextMetrics, nextApiStatus] = await Promise.all([getRuntimeMetrics(), getApiStatus()]);
       metrics = nextMetrics;
@@ -351,7 +352,7 @@
   async function stopEngine() {
     engineBusy = true;
     try {
-      engineStatus = await stopLlamaServer();
+      engineStatus = await stopInferenceEngine();
       engineNotice = engineStatus.message;
       const [nextMetrics, nextApiStatus] = await Promise.all([getRuntimeMetrics(), getApiStatus()]);
       metrics = nextMetrics;

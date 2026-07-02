@@ -31,7 +31,10 @@ const MAX_GGUF_ARRAY_ITEMS: u64 = 2_000_000;
 const MAX_GGUF_ARRAY_DEPTH: u8 = 4;
 const DEFAULT_API_HOST: &str = "127.0.0.1";
 const DEFAULT_API_PORT: u16 = 8080;
+const BACKEND_LLAMA_CPP: &str = "llama.cpp";
+const BACKEND_MISTRAL_RS: &str = "mistral.rs";
 const LLAMA_SERVER_ENV: &str = "KIVARRO_LLAMA_SERVER";
+const MISTRALRS_ENV: &str = "KIVARRO_MISTRALRS";
 const API_PORT_ENV: &str = "KIVARRO_API_PORT";
 const MAX_HTTP_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 const HTTP_HEALTH_TIMEOUT_MS: u64 = 400;
@@ -353,6 +356,15 @@ struct StreamAccumulator {
     finish_reason: Option<String>,
 }
 
+struct ActiveEngineContext {
+    host: String,
+    port: u16,
+    backend: String,
+    active_model_id: String,
+    active_model_name: String,
+    request_model_name: String,
+}
+
 struct EngineRuntime {
     inner: Mutex<ManagedEngine>,
     stream_cancellations: Mutex<HashMap<String, Arc<AtomicBool>>>,
@@ -360,8 +372,10 @@ struct EngineRuntime {
 
 struct ManagedEngine {
     child: Option<Child>,
+    active_backend: String,
     active_model_id: Option<String>,
     active_model_name: Option<String>,
+    active_request_model: Option<String>,
     host: String,
     port: u16,
     last_error: Option<String>,
@@ -383,8 +397,10 @@ impl Default for ManagedEngine {
     fn default() -> Self {
         Self {
             child: None,
+            active_backend: BACKEND_LLAMA_CPP.to_string(),
             active_model_id: None,
             active_model_name: None,
+            active_request_model: None,
             host: DEFAULT_API_HOST.to_string(),
             port: configured_api_port(),
             last_error: None,
@@ -730,25 +746,46 @@ fn get_engine_status(engine: State<'_, EngineRuntime>) -> Result<EngineStatus, S
 }
 
 #[tauri::command]
+fn start_inference_engine(
+    engine: State<'_, EngineRuntime>,
+    model_id: String,
+    profile: InferenceProfile,
+) -> Result<EngineStatus, String> {
+    let backend = profile_backend(&profile)?;
+    start_engine_for_backend(engine, model_id, profile, backend)
+}
+
+#[tauri::command]
 fn start_llama_server(
     engine: State<'_, EngineRuntime>,
     model_id: String,
     profile: InferenceProfile,
 ) -> Result<EngineStatus, String> {
+    start_engine_for_backend(engine, model_id, profile, BACKEND_LLAMA_CPP)
+}
+
+fn start_engine_for_backend(
+    engine: State<'_, EngineRuntime>,
+    model_id: String,
+    mut profile: InferenceProfile,
+    backend: &'static str,
+) -> Result<EngineStatus, String> {
+    profile.runtime.backend = backend.to_string();
     validate_profile(&profile)?;
 
     let model_path = canonical_model_path(&model_id)?;
-    if !is_gguf_file(&model_path) {
-        return Err("llama-server requires a GGUF model for this adapter slice".to_string());
+    if backend == BACKEND_LLAMA_CPP && !is_gguf_file(&model_path) {
+        return Err("llama.cpp requires a GGUF model file.".to_string());
     }
     let canonical_model_id = model_path.to_string_lossy().to_string();
 
-    let binary_path = find_llama_server_binary()
-        .ok_or_else(|| format!("llama-server not found. Set {LLAMA_SERVER_ENV} to the binary path or add llama-server to PATH."))?;
+    let binary_path =
+        find_engine_binary(backend).ok_or_else(|| engine_binary_missing_message(backend))?;
     let model_name = model_display_name_from_path(&model_path);
+    let request_model = request_model_name(backend, &model_name);
     let port = configured_api_port();
     let host = DEFAULT_API_HOST.to_string();
-    let args = build_llama_server_args(&model_path, &profile, &host, port);
+    let args = build_engine_args(backend, &model_path, &profile, &host, port);
 
     let mut guard = engine
         .inner
@@ -757,6 +794,7 @@ fn start_llama_server(
 
     refresh_engine_process(&mut guard);
     if guard.child.is_some()
+        && guard.active_backend == backend
         && guard.active_model_id.as_deref() == Some(canonical_model_id.as_str())
     {
         guard.last_error = None;
@@ -777,14 +815,17 @@ fn start_llama_server(
 
     let child = command.spawn().map_err(|err| {
         format!(
-            "failed to start llama-server at {}: {err}",
+            "failed to start {} at {}: {err}",
+            engine_process_label(backend),
             binary_path.display()
         )
     })?;
 
     guard.child = Some(child);
+    guard.active_backend = backend.to_string();
     guard.active_model_id = Some(canonical_model_id);
     guard.active_model_name = Some(model_name);
+    guard.active_request_model = Some(request_model);
     guard.host = host;
     guard.port = port;
     guard.last_error = None;
@@ -796,7 +837,7 @@ fn start_llama_server(
 }
 
 #[tauri::command]
-fn stop_llama_server(engine: State<'_, EngineRuntime>) -> Result<EngineStatus, String> {
+fn stop_inference_engine(engine: State<'_, EngineRuntime>) -> Result<EngineStatus, String> {
     let mut guard = engine
         .inner
         .lock()
@@ -805,14 +846,21 @@ fn stop_llama_server(engine: State<'_, EngineRuntime>) -> Result<EngineStatus, S
     stop_child(&mut guard)?;
     guard.active_model_id = None;
     guard.active_model_name = None;
+    guard.active_request_model = None;
     guard.last_error = None;
     guard.last_tokens_per_second = 0.0;
     guard.context_used_tokens = 0;
+    let backend = guard.active_backend.clone();
 
     Ok(engine_status_from_guard(
         &mut guard,
-        find_llama_server_binary(),
+        find_engine_binary(&backend),
     ))
+}
+
+#[tauri::command]
+fn stop_llama_server(engine: State<'_, EngineRuntime>) -> Result<EngineStatus, String> {
+    stop_inference_engine(engine)
 }
 
 #[tauri::command]
@@ -853,51 +901,33 @@ fn run_chat_completion(
     let requested_model_id = canonical_model_path(&model_id)?
         .to_string_lossy()
         .to_string();
+    let active_context = active_engine_context(&engine, &requested_model_id)?;
+    let process_label = engine_process_label(&active_context.backend);
 
-    let (host, port, active_model_id, active_model_name) = {
-        let mut guard = engine
-            .inner
-            .lock()
-            .map_err(|_| "engine state lock is poisoned".to_string())?;
-        refresh_engine_process(&mut guard);
-
-        let active_model_id = guard
-            .active_model_id
-            .clone()
-            .ok_or_else(|| "no llama-server model is loaded".to_string())?;
-        if active_model_id != requested_model_id {
-            return Err("selected model is not the active llama-server model".to_string());
-        }
-        if guard.child.is_none() {
-            return Err("llama-server is not running".to_string());
-        }
-
-        (
-            guard.host.clone(),
-            guard.port,
-            active_model_id,
-            guard
-                .active_model_name
-                .clone()
-                .unwrap_or_else(|| "local-model".to_string()),
-        )
-    };
-
-    match probe_llama_health(&host, port, HTTP_HEALTH_TIMEOUT_MS) {
+    match probe_engine_health(
+        &active_context.host,
+        active_context.port,
+        HTTP_HEALTH_TIMEOUT_MS,
+    ) {
         HealthProbe::Ready => {}
         HealthProbe::Loading(message) => {
-            return Err(format!("llama-server is still loading: {message}"));
+            return Err(format!("{process_label} is still loading: {message}"));
         }
         HealthProbe::Offline(message) => {
-            return Err(format!("llama-server is not reachable: {message}"));
+            return Err(format!("{process_label} is not reachable: {message}"));
         }
     }
 
     let started = SystemTime::now();
-    let payload = build_chat_completion_payload(&profile, &active_model_name, prompt, &history)?;
+    let payload = build_chat_completion_payload(
+        &profile,
+        &active_context.request_model_name,
+        prompt,
+        &history,
+    )?;
     let response = http_json_request(
-        &host,
-        port,
+        &active_context.host,
+        active_context.port,
         "POST",
         "/v1/chat/completions",
         Some(&payload),
@@ -907,7 +937,7 @@ fn run_chat_completion(
         .elapsed()
         .map(|elapsed| elapsed.as_millis())
         .unwrap_or_default();
-    let body = parse_llama_json_response(response)?;
+    let body = parse_openai_json_response(response, process_label)?;
     let content = body
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
@@ -916,7 +946,7 @@ fn run_chat_completion(
         .to_string();
 
     if content.is_empty() {
-        return Err("llama-server returned an empty completion".to_string());
+        return Err(format!("{process_label} returned an empty completion"));
     }
 
     let prompt_tokens = json_u32(&body, "/usage/prompt_tokens");
@@ -942,15 +972,15 @@ fn run_chat_completion(
                 .min(profile.runtime.context_length)
         });
         guard.context_total_tokens = profile.runtime.context_length;
-        guard.active_model_id = Some(active_model_id);
-        guard.active_model_name = Some(active_model_name.clone());
+        guard.active_model_id = Some(active_context.active_model_id);
+        guard.active_model_name = Some(active_context.active_model_name.clone());
         guard.last_error = None;
     }
 
     Ok(InferenceRunResult {
         content,
-        model: active_model_name,
-        backend: "llama.cpp".to_string(),
+        model: active_context.active_model_name,
+        backend: active_context.backend,
         elapsed_ms,
         tokens_per_second,
         prompt_tokens,
@@ -985,63 +1015,44 @@ fn run_chat_completion_stream(
         .to_string();
     let cancel_token = register_stream_cancellation(&engine, &request_id)?;
 
-    let active_context = (|| -> Result<(String, u16, String, String), String> {
-        let mut guard = engine
-            .inner
-            .lock()
-            .map_err(|_| "engine state lock is poisoned".to_string())?;
-        refresh_engine_process(&mut guard);
-
-        let active_model_id = guard
-            .active_model_id
-            .clone()
-            .ok_or_else(|| "no llama-server model is loaded".to_string())?;
-        if active_model_id != requested_model_id {
-            return Err("selected model is not the active llama-server model".to_string());
-        }
-        if guard.child.is_none() {
-            return Err("llama-server is not running".to_string());
-        }
-
-        Ok((
-            guard.host.clone(),
-            guard.port,
-            active_model_id,
-            guard
-                .active_model_name
-                .clone()
-                .unwrap_or_else(|| "local-model".to_string()),
-        ))
-    })();
-    let (host, port, active_model_id, active_model_name) = match active_context {
+    let active_context = match active_engine_context(&engine, &requested_model_id) {
         Ok(context) => context,
         Err(err) => {
             unregister_stream_cancellation(&engine, &request_id);
             return Err(err);
         }
     };
+    let process_label = engine_process_label(&active_context.backend);
 
-    match probe_llama_health(&host, port, HTTP_HEALTH_TIMEOUT_MS) {
+    match probe_engine_health(
+        &active_context.host,
+        active_context.port,
+        HTTP_HEALTH_TIMEOUT_MS,
+    ) {
         HealthProbe::Ready => {}
         HealthProbe::Loading(message) => {
             unregister_stream_cancellation(&engine, &request_id);
-            return Err(format!("llama-server is still loading: {message}"));
+            return Err(format!("{process_label} is still loading: {message}"));
         }
         HealthProbe::Offline(message) => {
             unregister_stream_cancellation(&engine, &request_id);
-            return Err(format!("llama-server is not reachable: {message}"));
+            return Err(format!("{process_label} is not reachable: {message}"));
         }
     }
 
     let started = std::time::Instant::now();
-    let mut payload =
-        match build_chat_completion_payload(&profile, &active_model_name, prompt, &history) {
-            Ok(payload) => payload,
-            Err(err) => {
-                unregister_stream_cancellation(&engine, &request_id);
-                return Err(err);
-            }
-        };
+    let mut payload = match build_chat_completion_payload(
+        &profile,
+        &active_context.request_model_name,
+        prompt,
+        &history,
+    ) {
+        Ok(payload) => payload,
+        Err(err) => {
+            unregister_stream_cancellation(&engine, &request_id);
+            return Err(err);
+        }
+    };
     payload["stream"] = json!(true);
 
     if let Err(err) = emit_stream_event(
@@ -1051,7 +1062,7 @@ fn run_chat_completion_stream(
             phase: "started".to_string(),
             delta: String::new(),
             content: String::new(),
-            model: active_model_name.clone(),
+            model: active_context.active_model_name.clone(),
             completion_tokens: 0,
             tokens_per_second: 0.0,
             elapsed_ms: 0,
@@ -1064,8 +1075,8 @@ fn run_chat_completion_stream(
 
     let mut accumulator = StreamAccumulator::default();
     let stream_result = http_sse_request(
-        &host,
-        port,
+        &active_context.host,
+        active_context.port,
         "POST",
         "/v1/chat/completions",
         &payload,
@@ -1086,7 +1097,7 @@ fn run_chat_completion_stream(
                         phase: "delta".to_string(),
                         delta: chunk.delta,
                         content: accumulator.content.clone(),
-                        model: active_model_name.clone(),
+                        model: active_context.active_model_name.clone(),
                         completion_tokens: accumulator.completion_tokens,
                         tokens_per_second,
                         elapsed_ms,
@@ -1112,7 +1123,7 @@ fn run_chat_completion_stream(
                 phase: phase.to_string(),
                 delta: String::new(),
                 content: accumulator.content,
-                model: active_model_name,
+                model: active_context.active_model_name.clone(),
                 completion_tokens: accumulator.completion_tokens,
                 tokens_per_second: 0.0,
                 elapsed_ms: started.elapsed().as_millis(),
@@ -1133,7 +1144,9 @@ fn run_chat_completion_stream(
 
     if accumulator.content.is_empty() {
         unregister_stream_cancellation(&engine, &request_id);
-        return Err("llama-server returned an empty streamed completion".to_string());
+        return Err(format!(
+            "{process_label} returned an empty streamed completion"
+        ));
     }
 
     let elapsed_ms = started.elapsed().as_millis();
@@ -1151,8 +1164,8 @@ fn run_chat_completion_stream(
             .unwrap_or_default()
             .min(profile.runtime.context_length);
         guard.context_total_tokens = profile.runtime.context_length;
-        guard.active_model_id = Some(active_model_id);
-        guard.active_model_name = Some(active_model_name.clone());
+        guard.active_model_id = Some(active_context.active_model_id.clone());
+        guard.active_model_name = Some(active_context.active_model_name.clone());
         guard.last_error = None;
     }
 
@@ -1163,7 +1176,7 @@ fn run_chat_completion_stream(
             phase: "done".to_string(),
             delta: String::new(),
             content: accumulator.content.clone(),
-            model: active_model_name.clone(),
+            model: active_context.active_model_name.clone(),
             completion_tokens: accumulator.completion_tokens,
             tokens_per_second,
             elapsed_ms,
@@ -1175,8 +1188,8 @@ fn run_chat_completion_stream(
 
     Ok(InferenceRunResult {
         content: accumulator.content,
-        model: active_model_name,
-        backend: "llama.cpp".to_string(),
+        model: active_context.active_model_name,
+        backend: active_context.backend,
         elapsed_ms,
         tokens_per_second,
         prompt_tokens: None,
@@ -1198,8 +1211,10 @@ fn get_api_status(engine: State<'_, EngineRuntime>) -> Result<ApiStatus, String>
             ApiEndpoint {
                 method: "POST".to_string(),
                 path: "/v1/chat/completions".to_string(),
-                description: "OpenAI-compatible local chat completions through llama-server"
-                    .to_string(),
+                description: format!(
+                    "OpenAI-compatible local chat completions through {}",
+                    status.backend
+                ),
                 status: if status.health_ok { "Ready" } else { "Offline" }.to_string(),
             },
             ApiEndpoint {
@@ -1217,7 +1232,7 @@ fn get_api_status(engine: State<'_, EngineRuntime>) -> Result<ApiStatus, String>
             ApiEndpoint {
                 method: "GET".to_string(),
                 path: "/health".to_string(),
-                description: "llama-server readiness probe".to_string(),
+                description: "Local engine readiness probe".to_string(),
                 status: status.state,
             },
         ],
@@ -1514,6 +1529,9 @@ fn normalize_profile(mut profile: InferenceProfile) -> InferenceProfile {
     if profile.created_at.trim().is_empty() {
         profile.created_at = now.clone();
     }
+    profile.runtime.backend = canonical_backend(&profile.runtime.backend)
+        .unwrap_or(BACKEND_LLAMA_CPP)
+        .to_string();
     profile.updated_at = now;
     profile
 }
@@ -1543,10 +1561,28 @@ fn validate_profile(profile: &InferenceProfile) -> Result<(), String> {
     if profile.runtime.cpu_threads == 0 {
         return Err("cpu thread count must be greater than zero".to_string());
     }
+    profile_backend(profile)?;
     if profile.output.top_logprobs > 20 {
         return Err("top_logprobs must be 20 or lower".to_string());
     }
     Ok(())
+}
+
+fn canonical_backend(value: &str) -> Option<&'static str> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "llama" | "llama.cpp" | "llama-cpp" | "llamacpp" => Some(BACKEND_LLAMA_CPP),
+        "mistral" | "mistral.rs" | "mistral-rs" | "mistralrs" => Some(BACKEND_MISTRAL_RS),
+        _ => None,
+    }
+}
+
+fn profile_backend(profile: &InferenceProfile) -> Result<&'static str, String> {
+    canonical_backend(&profile.runtime.backend).ok_or_else(|| {
+        format!(
+            "unsupported backend '{}'. Choose llama.cpp or mistral.rs.",
+            profile.runtime.backend
+        )
+    })
 }
 
 fn is_profile_file(path: &Path) -> bool {
@@ -1615,12 +1651,57 @@ fn unregister_stream_cancellation(engine: &State<'_, EngineRuntime>, request_id:
     }
 }
 
-fn current_engine_status(engine: &State<'_, EngineRuntime>) -> Result<EngineStatus, String> {
-    let binary_path = find_llama_server_binary();
+fn active_engine_context(
+    engine: &State<'_, EngineRuntime>,
+    requested_model_id: &str,
+) -> Result<ActiveEngineContext, String> {
     let mut guard = engine
         .inner
         .lock()
         .map_err(|_| "engine state lock is poisoned".to_string())?;
+    refresh_engine_process(&mut guard);
+
+    let backend = guard.active_backend.clone();
+    let process_label = engine_process_label(&backend);
+    let active_model_id = guard
+        .active_model_id
+        .clone()
+        .ok_or_else(|| format!("no {process_label} model is loaded"))?;
+    if active_model_id != requested_model_id {
+        return Err(format!(
+            "selected model is not the active {} model",
+            backend
+        ));
+    }
+    if guard.child.is_none() {
+        return Err(format!("{process_label} is not running"));
+    }
+
+    let active_model_name = guard
+        .active_model_name
+        .clone()
+        .unwrap_or_else(|| "local-model".to_string());
+    let request_model_name = guard
+        .active_request_model
+        .clone()
+        .unwrap_or_else(|| request_model_name(&backend, &active_model_name));
+
+    Ok(ActiveEngineContext {
+        host: guard.host.clone(),
+        port: guard.port,
+        backend,
+        active_model_id,
+        active_model_name,
+        request_model_name,
+    })
+}
+
+fn current_engine_status(engine: &State<'_, EngineRuntime>) -> Result<EngineStatus, String> {
+    let mut guard = engine
+        .inner
+        .lock()
+        .map_err(|_| "engine state lock is poisoned".to_string())?;
+    let binary_path = find_engine_binary(&guard.active_backend);
 
     Ok(engine_status_from_guard(&mut guard, binary_path))
 }
@@ -1632,11 +1713,13 @@ fn engine_status_from_guard(
     refresh_engine_process(guard);
 
     let pid = guard.child.as_ref().map(Child::id);
+    let backend = guard.active_backend.clone();
+    let process_label = engine_process_label(&backend);
     let (state, message, health_ok) = if guard.child.is_some() {
-        match probe_llama_health(&guard.host, guard.port, HTTP_HEALTH_TIMEOUT_MS) {
+        match probe_engine_health(&guard.host, guard.port, HTTP_HEALTH_TIMEOUT_MS) {
             HealthProbe::Ready => (
                 "ready".to_string(),
-                "llama-server is ready for local chat completions".to_string(),
+                format!("{process_label} is ready for local chat completions"),
                 true,
             ),
             HealthProbe::Loading(message) => ("loading".to_string(), message, false),
@@ -1647,19 +1730,19 @@ fn engine_status_from_guard(
     } else if binary_path.is_some() {
         (
             "offline".to_string(),
-            "llama-server is configured but no model is loaded".to_string(),
+            format!("{process_label} is configured but no model is loaded"),
             false,
         )
     } else {
         (
             "unconfigured".to_string(),
-            format!("Set {LLAMA_SERVER_ENV} or add llama-server to PATH"),
+            engine_binary_missing_message(&backend),
             false,
         )
     };
 
     EngineStatus {
-        backend: "llama.cpp".to_string(),
+        backend,
         state,
         message,
         configured: binary_path.is_some(),
@@ -1685,12 +1768,18 @@ fn refresh_engine_process(guard: &mut ManagedEngine) {
     match child.try_wait() {
         Ok(Some(status)) => {
             guard.child = None;
-            guard.last_error = Some(format!("llama-server exited with status {status}"));
+            guard.last_error = Some(format!(
+                "{} exited with status {status}",
+                engine_process_label(&guard.active_backend)
+            ));
         }
         Ok(None) => {}
         Err(err) => {
             guard.child = None;
-            guard.last_error = Some(format!("failed to inspect llama-server process: {err}"));
+            guard.last_error = Some(format!(
+                "failed to inspect {} process: {err}",
+                engine_process_label(&guard.active_backend)
+            ));
         }
     }
 }
@@ -1703,15 +1792,19 @@ fn stop_child(guard: &mut ManagedEngine) -> Result<(), String> {
     match child.try_wait() {
         Ok(Some(_)) => Ok(()),
         Ok(None) => {
+            let process_label = engine_process_label(&guard.active_backend);
             child
                 .kill()
-                .map_err(|err| format!("failed to stop llama-server: {err}"))?;
+                .map_err(|err| format!("failed to stop {process_label}: {err}"))?;
             child
                 .wait()
                 .map(|_| ())
-                .map_err(|err| format!("failed to wait for llama-server shutdown: {err}"))
+                .map_err(|err| format!("failed to wait for {process_label} shutdown: {err}"))
         }
-        Err(err) => Err(format!("failed to inspect llama-server before stop: {err}")),
+        Err(err) => Err(format!(
+            "failed to inspect {} before stop: {err}",
+            engine_process_label(&guard.active_backend)
+        )),
     }
 }
 
@@ -1749,6 +1842,38 @@ fn model_display_name_from_path(path: &Path) -> String {
         })
 }
 
+fn find_engine_binary(backend: &str) -> Option<PathBuf> {
+    match canonical_backend(backend).unwrap_or(BACKEND_LLAMA_CPP) {
+        BACKEND_MISTRAL_RS => find_mistralrs_binary(),
+        _ => find_llama_server_binary(),
+    }
+}
+
+fn engine_process_label(backend: &str) -> &'static str {
+    match canonical_backend(backend).unwrap_or(BACKEND_LLAMA_CPP) {
+        BACKEND_MISTRAL_RS => "mistralrs serve",
+        _ => "llama-server",
+    }
+}
+
+fn engine_binary_missing_message(backend: &str) -> String {
+    match canonical_backend(backend).unwrap_or(BACKEND_LLAMA_CPP) {
+        BACKEND_MISTRAL_RS => {
+            format!("mistralrs not found. Set {MISTRALRS_ENV} to the binary path or add mistralrs to PATH.")
+        }
+        _ => format!(
+            "llama-server not found. Set {LLAMA_SERVER_ENV} to the binary path or add llama-server to PATH."
+        ),
+    }
+}
+
+fn request_model_name(backend: &str, display_name: &str) -> String {
+    match canonical_backend(backend).unwrap_or(BACKEND_LLAMA_CPP) {
+        BACKEND_MISTRAL_RS => "default".to_string(),
+        _ => display_name.to_string(),
+    }
+}
+
 fn find_llama_server_binary() -> Option<PathBuf> {
     if let Ok(value) = env::var(LLAMA_SERVER_ENV) {
         let trimmed = value.trim().trim_matches('"');
@@ -1766,6 +1891,30 @@ fn find_llama_server_binary() -> Option<PathBuf> {
     ["llama-server", "llama-server.exe", "server", "server.exe"]
         .iter()
         .find_map(|candidate| find_executable_on_path(candidate))
+}
+
+fn find_mistralrs_binary() -> Option<PathBuf> {
+    if let Ok(value) = env::var(MISTRALRS_ENV) {
+        let trimmed = value.trim().trim_matches('"');
+        if !trimmed.is_empty() {
+            let configured = PathBuf::from(trimmed);
+            if configured.is_file() {
+                return Some(configured);
+            }
+            if let Some(found) = find_executable_on_path(trimmed) {
+                return Some(found);
+            }
+        }
+    }
+
+    [
+        "mistralrs",
+        "mistralrs.exe",
+        "mistralrs-server",
+        "mistralrs-server.exe",
+    ]
+    .iter()
+    .find_map(|candidate| find_executable_on_path(candidate))
 }
 
 fn find_executable_on_path(candidate: &str) -> Option<PathBuf> {
@@ -1881,6 +2030,32 @@ fn build_llama_server_args(
     args
 }
 
+fn build_engine_args(
+    backend: &str,
+    model_path: &Path,
+    profile: &InferenceProfile,
+    host: &str,
+    port: u16,
+) -> Vec<String> {
+    match canonical_backend(backend).unwrap_or(BACKEND_LLAMA_CPP) {
+        BACKEND_MISTRAL_RS => build_mistralrs_serve_args(model_path, host, port),
+        _ => build_llama_server_args(model_path, profile, host, port),
+    }
+}
+
+fn build_mistralrs_serve_args(model_path: &Path, host: &str, port: u16) -> Vec<String> {
+    vec![
+        "serve".to_string(),
+        "-m".to_string(),
+        model_path.to_string_lossy().to_string(),
+        "--host".to_string(),
+        host.to_string(),
+        "-p".to_string(),
+        port.to_string(),
+        "--no-ui".to_string(),
+    ]
+}
+
 fn format_float_arg(value: f32) -> String {
     let formatted = format!("{value:.6}");
     formatted
@@ -1895,7 +2070,7 @@ enum HealthProbe {
     Offline(String),
 }
 
-fn probe_llama_health(host: &str, port: u16, timeout_ms: u64) -> HealthProbe {
+fn probe_engine_health(host: &str, port: u16, timeout_ms: u64) -> HealthProbe {
     match http_json_request(host, port, "GET", "/health", None, timeout_ms) {
         Ok(response) if response.status_code == 200 => HealthProbe::Ready,
         Ok(response) if response.status_code == 503 => {
@@ -2031,10 +2206,10 @@ fn http_json_request(
         .unwrap_or_default();
     let address = format!("{host}:{port}")
         .parse::<SocketAddr>()
-        .map_err(|err| format!("invalid llama-server address {host}:{port}: {err}"))?;
+        .map_err(|err| format!("invalid local engine address {host}:{port}: {err}"))?;
     let timeout = std::time::Duration::from_millis(timeout_ms);
     let mut stream = TcpStream::connect_timeout(&address, timeout)
-        .map_err(|err| format!("failed to connect to llama-server at {host}:{port}: {err}"))?;
+        .map_err(|err| format!("failed to connect to local engine at {host}:{port}: {err}"))?;
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|err| format!("failed to set read timeout: {err}"))?;
@@ -2061,7 +2236,7 @@ fn http_json_request(
         .map_err(|err| format!("failed to read HTTP response: {err}"))?;
     if raw.len() as u64 > MAX_HTTP_RESPONSE_BYTES {
         return Err(format!(
-            "llama-server response exceeds {} bytes",
+            "local engine response exceeds {} bytes",
             MAX_HTTP_RESPONSE_BYTES
         ));
     }
@@ -2136,16 +2311,19 @@ fn decode_chunked_body(raw: &[u8]) -> Result<Vec<u8>, String> {
     }
 }
 
-fn parse_llama_json_response(response: HttpResponse) -> Result<Value, String> {
+fn parse_openai_json_response(
+    response: HttpResponse,
+    process_label: &str,
+) -> Result<Value, String> {
     let body = serde_json::from_slice::<Value>(&response.body)
-        .map_err(|err| format!("llama-server returned invalid JSON: {err}"))?;
+        .map_err(|err| format!("{process_label} returned invalid JSON: {err}"))?;
     if response.status_code >= 400 {
         let message = body
             .pointer("/error/message")
             .and_then(Value::as_str)
-            .unwrap_or("llama-server request failed");
+            .unwrap_or("local engine request failed");
         return Err(format!(
-            "llama-server HTTP {}: {message}",
+            "{process_label} HTTP {}: {message}",
             response.status_code
         ));
     }
@@ -2191,10 +2369,10 @@ where
         serde_json::to_vec(body).map_err(|err| format!("failed to encode request JSON: {err}"))?;
     let address = format!("{host}:{port}")
         .parse::<SocketAddr>()
-        .map_err(|err| format!("invalid llama-server address {host}:{port}: {err}"))?;
+        .map_err(|err| format!("invalid local engine address {host}:{port}: {err}"))?;
     let timeout = std::time::Duration::from_millis(timeout_ms);
     let mut stream = TcpStream::connect_timeout(&address, timeout)
-        .map_err(|err| format!("failed to connect to llama-server at {host}:{port}: {err}"))?;
+        .map_err(|err| format!("failed to connect to local engine at {host}:{port}: {err}"))?;
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|err| format!("failed to set read timeout: {err}"))?;
@@ -2224,7 +2402,7 @@ where
             })
             .unwrap_or_else(|| String::from_utf8_lossy(&body).trim().to_string());
         return Err(format!(
-            "llama-server streaming request failed with HTTP {status_code}: {message}"
+            "local engine streaming request failed with HTTP {status_code}: {message}"
         ));
     }
 
@@ -2242,7 +2420,7 @@ where
         bytes_seen = bytes_seen.saturating_add(chunk.len() as u64);
         if bytes_seen > MAX_STREAM_RESPONSE_BYTES {
             return Err(format!(
-                "llama-server stream exceeds {} bytes",
+                "local engine stream exceeds {} bytes",
                 MAX_STREAM_RESPONSE_BYTES
             ));
         }
@@ -3304,6 +3482,23 @@ mod tests {
     }
 
     #[test]
+    fn builds_mistralrs_serve_args_from_model_path() {
+        let args =
+            build_mistralrs_serve_args(Path::new("D:/models/mistral.gguf"), DEFAULT_API_HOST, 9091);
+
+        assert_eq!(args.first().map(String::as_str), Some("serve"));
+        assert_arg_pair(&args, "-m", "D:/models/mistral.gguf");
+        assert_arg_pair(&args, "--host", DEFAULT_API_HOST);
+        assert_arg_pair(&args, "-p", "9091");
+        assert!(args.iter().any(|arg| arg == "--no-ui"));
+        assert_eq!(canonical_backend("mistralrs"), Some(BACKEND_MISTRAL_RS));
+        assert_eq!(
+            request_model_name(BACKEND_MISTRAL_RS, "Mistral Local"),
+            "default"
+        );
+    }
+
+    #[test]
     fn parses_split_openai_sse_chat_deltas() {
         let mut buffer = Vec::new();
         let mut deltas = Vec::new();
@@ -3441,7 +3636,9 @@ pub fn run() {
             delete_inference_profile,
             get_model_load_plan,
             get_engine_status,
+            start_inference_engine,
             start_llama_server,
+            stop_inference_engine,
             stop_llama_server,
             cancel_chat_completion_stream,
             run_chat_completion,

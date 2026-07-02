@@ -73,7 +73,7 @@ const fallbackApiStatus: ApiStatus = {
 const fallbackEngineStatus: EngineStatus = {
   backend: "llama.cpp",
   state: "preview",
-  message: "Open Kivarro in Tauri to supervise a local llama-server process.",
+  message: "Open Kivarro in Tauri to supervise a local inference engine.",
   configured: false,
   binaryPath: null,
   pid: null,
@@ -355,15 +355,15 @@ export function getEngineStatus(): Promise<EngineStatus> {
   return safeInvoke("get_engine_status", fallbackEngineStatus);
 }
 
-export function startLlamaServer(
+export function startInferenceEngine(
   modelId: string,
   profile: InferenceProfile,
 ): Promise<EngineStatus> {
-  return invokeOrPreview("start_llama_server", fallbackEngineStatus, { modelId, profile });
+  return invokeOrPreview("start_inference_engine", fallbackEngineStatus, { modelId, profile });
 }
 
-export function stopLlamaServer(): Promise<EngineStatus> {
-  return invokeOrPreview("stop_llama_server", fallbackEngineStatus);
+export function stopInferenceEngine(): Promise<EngineStatus> {
+  return invokeOrPreview("stop_inference_engine", fallbackEngineStatus);
 }
 
 export function cancelChatCompletionStream(requestId: string): Promise<boolean> {
