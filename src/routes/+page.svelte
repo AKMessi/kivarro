@@ -219,6 +219,7 @@
   $: activeKnowledgeBase =
     knowledgeBases.find((base) => base.id === selectedKnowledgeBaseId) ?? knowledgeBases[0] ?? null;
   $: configuredBaseUrl = apiStatus?.baseUrl ?? `http://${apiSettings.host}:${apiSettings.port}/v1`;
+  $: profilePreviewJson = JSON.stringify(buildProfileFromControls(), null, 2);
   $: engineOnline = engineStatus?.state === "ready";
   $: engineLoading = engineStatus?.state === "loading";
   $: apiEndpointLocked = engineOnline || engineLoading || Boolean(apiStatus?.enabled);
@@ -1540,24 +1541,12 @@
 
         <section class="schema-editor">
           <div>
-            <div class="panel-header inline"><span>JSON schema / GBNF</span><code>validated</code></div>
-            <pre>{
-`{
-  "type": "object",
-  "properties": {
-    "answer": { "type": "string" },
-    "confidence": { "type": "number" }
-  },
-  "required": ["answer"]
-}`}</pre>
+            <div class="panel-header inline"><span>Live profile JSON</span><code>{activeProfile.id}</code></div>
+            <pre>{profilePreviewJson}</pre>
           </div>
           <div>
-            <div class="panel-header inline"><span>Output preview</span><code>strict</code></div>
-            <pre>{
-`{
-  "answer": "Pending local model output",
-  "confidence": 0.0
-}`}</pre>
+            <div class="panel-header inline"><span>Output constraints</span><code>{activeProfile.output.mode}</code></div>
+            <pre>{JSON.stringify(activeProfile.output, null, 2)}</pre>
           </div>
         </section>
       {:else if activeView === "knowledge"}
@@ -1844,13 +1833,67 @@
             <h1>Application control plane</h1>
           </div>
         </section>
-        <section class="settings-grid">
-          {#each ["Model directory", "Telemetry", "Appearance", "Security", "Updates", "Backups"] as setting}
-            <article>
-              <span>{setting}</span>
-              <small>Production setting surface reserved for the next implementation pass.</small>
-            </article>
-          {/each}
+        <section class="settings-workspace">
+          <article>
+            <div class="panel-header inline"><span>General</span><code>runtime</code></div>
+            <label>
+              <span>Default profile</span>
+              <select bind:value={selectedProfileId} onchange={(event) => selectProfile(event.currentTarget.value)}>
+                {#each profiles as profile}
+                  <option value={profile.id}>{profile.name}</option>
+                {/each}
+              </select>
+            </label>
+            <label>
+              <span>Default backend</span>
+              <select bind:value={sampling.backend}>
+                <option value="llama.cpp">llama.cpp</option>
+                <option value="mistral.rs">mistral.rs</option>
+              </select>
+            </label>
+          </article>
+          <article>
+            <div class="panel-header inline"><span>Appearance</span><code>{theme}</code></div>
+            <label class="toggle-line">
+              <span>Light mode</span>
+              <input type="checkbox" checked={theme === "light"} onchange={toggleTheme} />
+            </label>
+            <label class="toggle-line">
+              <span>Collapse inspector</span>
+              <input type="checkbox" bind:checked={rightCollapsed} />
+            </label>
+            <label class="toggle-line">
+              <span>Collapse context</span>
+              <input type="checkbox" bind:checked={leftCollapsed} />
+            </label>
+          </article>
+          <article>
+            <div class="panel-header inline"><span>Storage Paths</span><code>local</code></div>
+            <div class="path-row">
+              <span>Model library</span>
+              <code>./models</code>
+            </div>
+            <div class="path-row">
+              <span>Profiles</span>
+              <code>app-config/profiles/*.kivarro.json</code>
+            </div>
+            <div class="path-row">
+              <span>RAG store</span>
+              <code>app-config/knowledge-store.json</code>
+            </div>
+          </article>
+          <article>
+            <div class="panel-header inline"><span>Advanced</span><code>api</code></div>
+            <label>
+              <span>API host</span>
+              <input disabled={apiEndpointLocked} bind:value={apiSettings.host} />
+            </label>
+            <label>
+              <span>API port</span>
+              <input type="number" min="1" max="65535" disabled={apiEndpointLocked} bind:value={apiSettings.port} />
+            </label>
+            <button class="primary-button" disabled={apiConfigBusy || apiEndpointLocked} onclick={saveCurrentApiSettings}>Save API endpoint</button>
+          </article>
         </section>
       {/if}
     </main>
@@ -2524,8 +2567,7 @@
   .rag-grid article,
   .agent-node,
   .api-dashboard,
-  .log-console,
-  .settings-grid article {
+  .log-console {
     border: 1px solid var(--border);
     border-radius: 8px;
     background: color-mix(in srgb, var(--panel) 94%, transparent);
@@ -2782,8 +2824,7 @@
   }
 
   .blueprint-grid,
-  .rag-grid,
-  .settings-grid {
+  .rag-grid {
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 12px;
@@ -3245,19 +3286,6 @@
 
   .log-line p {
     margin: 0;
-  }
-
-  .settings-grid article {
-    min-height: 120px;
-    display: grid;
-    align-content: start;
-    gap: 8px;
-    padding: 14px;
-  }
-
-  .settings-grid small {
-    color: var(--muted);
-    line-height: 1.5;
   }
 
   .inspector {
@@ -3730,7 +3758,6 @@
   .compute-block,
   .agent-node,
   .tool-permissions label,
-  .settings-grid article,
   .load-plan,
   .hardware-plan,
   .profile-strip,
@@ -4111,6 +4138,63 @@
     font-size: 18px;
   }
 
+  .settings-workspace {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+    padding: 14px;
+  }
+
+  .settings-workspace article {
+    display: grid;
+    align-content: start;
+    gap: 12px;
+    min-height: 210px;
+    padding: 14px;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-md);
+    background: var(--bg-panel);
+  }
+
+  .settings-workspace label {
+    display: grid;
+    gap: 6px;
+  }
+
+  .settings-workspace .toggle-line {
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+  }
+
+  .path-row {
+    display: grid;
+    grid-template-columns: 110px minmax(0, 1fr);
+    gap: 10px;
+    align-items: center;
+    min-height: 32px;
+    padding: 0 8px;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated);
+  }
+
+  .path-row span {
+    color: var(--text-tertiary);
+    font-size: var(--text-xs);
+  }
+
+  .path-row code {
+    overflow: hidden;
+    color: var(--text-secondary);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .schema-editor pre {
+    max-height: 360px;
+    font-size: 11px;
+  }
+
   .rag-grid,
   .knowledge-workbench {
     padding: 14px;
@@ -4167,7 +4251,6 @@
     .blueprint-grid,
     .rag-grid,
     .agent-canvas,
-    .settings-grid,
     .tool-permissions,
     .api-config-grid,
     .load-plan-grid,
@@ -4177,7 +4260,8 @@
     }
 
     .log-toolbar,
-    .benchmark-metrics {
+    .benchmark-metrics,
+    .settings-workspace {
       grid-template-columns: 1fr;
       width: 100%;
     }
