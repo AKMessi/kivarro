@@ -109,6 +109,13 @@
     streaming?: boolean;
   };
 
+  type RagChunkRow = {
+    index: number;
+    range: string;
+    score: number | null;
+    snippet: string;
+  };
+
   const navItems: NavItem[] = [
     { id: "command", label: "Command Center", icon: MessageSquare },
     { id: "models", label: "Model Registry", icon: Boxes },
@@ -161,6 +168,7 @@
   let modelImportPath = "";
   let modelImportBusy = false;
   let selectedKnowledgeBaseId = "";
+  let selectedKnowledgeDocumentId = "";
   let knowledgeImportPath = "";
   let newKnowledgeBaseName = "";
   let retrievalQuery = "";
@@ -229,6 +237,18 @@
   );
   $: activeKnowledgeBase =
     knowledgeBases.find((base) => base.id === selectedKnowledgeBaseId) ?? knowledgeBases[0] ?? null;
+  $: if (
+    knowledgeDocuments.length > 0 &&
+    !knowledgeDocuments.some((document) => document.id === selectedKnowledgeDocumentId)
+  ) {
+    selectedKnowledgeDocumentId = knowledgeDocuments[0].id;
+  }
+  $: if (knowledgeDocuments.length === 0 && selectedKnowledgeDocumentId) {
+    selectedKnowledgeDocumentId = "";
+  }
+  $: activeKnowledgeDocument =
+    knowledgeDocuments.find((document) => document.id === selectedKnowledgeDocumentId) ?? knowledgeDocuments[0] ?? null;
+  $: ragChunkRows = buildRagChunkRows(activeKnowledgeDocument, retrievalResults);
   $: configuredBaseUrl = apiStatus?.baseUrl ?? `http://${apiSettings.host}:${apiSettings.port}/v1`;
   $: profilePreviewJson = JSON.stringify(buildProfileFromControls(), null, 2);
   $: engineOnline = engineStatus?.state === "ready";
@@ -504,6 +524,11 @@
     selectedKnowledgeBaseId = knowledgeBaseId;
     retrievalResults = [];
     knowledgeDocuments = await listKnowledgeDocuments(knowledgeBaseId);
+    selectedKnowledgeDocumentId = knowledgeDocuments[0]?.id ?? "";
+  }
+
+  function selectKnowledgeDocument(documentId: string) {
+    selectedKnowledgeDocumentId = documentId;
   }
 
   async function createCurrentKnowledgeBase() {
@@ -518,6 +543,7 @@
       knowledgeDocuments = selectedKnowledgeBaseId
         ? await listKnowledgeDocuments(selectedKnowledgeBaseId)
         : [];
+      selectedKnowledgeDocumentId = knowledgeDocuments[0]?.id ?? "";
       retrievalResults = [];
       newKnowledgeBaseName = "";
       await refreshLogs();
@@ -667,6 +693,7 @@
       ].sort((left, right) => left.name.localeCompare(right.name));
       knowledgeDocuments = detail.documents;
       selectedKnowledgeBaseId = detail.base.id;
+      selectedKnowledgeDocumentId = detail.documents[0]?.id ?? "";
       retrievalResults = [];
       knowledgeImportPath = "";
       await refreshLogs();
@@ -828,6 +855,26 @@
     return new Intl.NumberFormat("en-US").format(value);
   }
 
+  function formatBytes(value: number) {
+    if (!Number.isFinite(value) || value <= 0) return "0 B";
+
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    let size = value;
+    let unitIndex = 0;
+    while (size >= 1024 && unitIndex < units.length - 1) {
+      size /= 1024;
+      unitIndex += 1;
+    }
+
+    return `${size >= 10 || unitIndex === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[unitIndex]}`;
+  }
+
+  function formatShortDate(value: string) {
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return value || "unknown";
+    return new Intl.DateTimeFormat("en-US", { month: "short", day: "2-digit" }).format(date);
+  }
+
   function optionalText(value: string | null | undefined, fallback = "unknown") {
     const trimmed = value?.trim();
     return trimmed ? trimmed : fallback;
@@ -855,6 +902,34 @@
   function benchmarkBarWidth(value: number | null | undefined) {
     const peak = Math.max(...benchmarks.map((result) => result.tokensPerSecond), 1);
     return clamp(((value ?? 0) / peak) * 100, 2, 100);
+  }
+
+  function buildRagChunkRows(
+    document: KnowledgeDocument | null,
+    matches: RetrievalMatch[],
+  ): RagChunkRow[] {
+    if (!document || document.chunkCount <= 0) return [];
+
+    const matchesByChunk = new Map(
+      matches
+        .filter((match) => match.documentId === document.id)
+        .map((match) => [match.chunkIndex, match]),
+    );
+    const visibleCount = Math.min(document.chunkCount, 24);
+
+    return Array.from({ length: visibleCount }, (_, index) => {
+      const match = matchesByChunk.get(index);
+      const start = index * 1200;
+      const end = start + 1199;
+      return {
+        index,
+        range: `${formatTokens(start)}-${formatTokens(end)}`,
+        score: match?.score ?? null,
+        snippet:
+          match?.snippet ??
+          `Indexed chunk ${index + 1} from ${document.name}. Run a retrieval query to inspect ranked content from this segment.`,
+      };
+    });
   }
 
   function createId(prefix: string) {
@@ -1234,6 +1309,23 @@
             <code>{base.chunkCount}</code>
           </button>
         {/each}
+        <div class="section-label">Document tree</div>
+        {#if knowledgeDocuments.length === 0}
+          <p class="muted-copy">No documents indexed in this base.</p>
+        {:else}
+          <div class="document-tree-list">
+            {#each knowledgeDocuments as document}
+              <button
+                class:active={selectedKnowledgeDocumentId === document.id}
+                onclick={() => selectKnowledgeDocument(document.id)}
+              >
+                <FileText size={14} />
+                <span>{document.name}</span>
+                <code>{document.chunkCount}</code>
+              </button>
+            {/each}
+          </div>
+        {/if}
       {:else if activeView === "tuning"}
         <div class="section-label">Saved profiles</div>
         <div class="profile-context-list">
@@ -1852,10 +1944,10 @@
           </div>
         </section>
 
-        <section class="rag-grid">
-          <article>
+        <section class="rag-workbench">
+          <aside class="rag-doc-tree">
             <div class="panel-header inline">
-              <span>Documents</span>
+              <span>Document Tree</span>
               <code>{knowledgeDocuments.length} files</code>
             </div>
             {#if knowledgeDocuments.length === 0}
@@ -1866,60 +1958,89 @@
             {:else}
               <div class="document-list">
                 {#each knowledgeDocuments as document}
-                  <div>
+                  <button
+                    class:active={selectedKnowledgeDocumentId === document.id}
+                    onclick={() => selectKnowledgeDocument(document.id)}
+                  >
                     <strong>{document.name}</strong>
-                    <span>{formatTokens(document.chunkCount)} chunks · {formatTokens(document.sizeBytes)} bytes</span>
+                    <span>{formatTokens(document.chunkCount)} chunks / {formatBytes(document.sizeBytes)}</span>
+                    <code>{formatShortDate(document.importedAt)}</code>
+                  </button>
+                {/each}
+              </div>
+            {/if}
+          </aside>
+          <article class="chunk-browser">
+            <div class="panel-header inline">
+              <span>Chunk Browser</span>
+              <code>{activeKnowledgeDocument ? `${formatTokens(activeKnowledgeDocument.chunkCount)} chunks` : "no document"}</code>
+            </div>
+            {#if !activeKnowledgeDocument}
+              <div class="empty-state compact">
+                <Database size={26} />
+                <span>Select or import a document to inspect generated chunks.</span>
+              </div>
+            {:else if ragChunkRows.length === 0}
+              <div class="empty-state compact">
+                <Database size={26} />
+                <span>{activeKnowledgeDocument.name} has no indexed chunks.</span>
+              </div>
+            {:else}
+              <div class="chunk-list">
+                {#each ragChunkRows as chunk}
+                  <div class:active={chunk.score !== null} class="chunk-row">
+                    <div>
+                      <code>#{chunk.index + 1}</code>
+                      <span>{chunk.range}</span>
+                    </div>
+                    <p>{chunk.snippet}</p>
+                    <i><b style={`width: ${(chunk.score ?? 0) * 100}%`}></b></i>
                   </div>
                 {/each}
               </div>
             {/if}
           </article>
-          <article>
+          <aside class="retrieval-panel">
             <div class="panel-header inline">
-              <span>Chunking Strategy</span>
+              <span>Retrieval Test</span>
               <code>{activeKnowledgeBase?.chunkCount ?? 0} chunks</code>
+            </div>
+            <div class="retrieval-query">
+              <input
+                placeholder="Test retrieval query..."
+                bind:value={retrievalQuery}
+                onkeydown={(event) => {
+                  if (event.key === "Enter") void runRetrievalTest();
+                }}
+              />
+              <button class="tool-button" disabled={knowledgeBusy || !retrievalQuery.trim()} onclick={runRetrievalTest}>Run</button>
             </div>
             <div class="rag-metric-grid">
               <div><span>Target</span><strong>1,200 chars</strong></div>
               <div><span>Overlap</span><strong>160 chars</strong></div>
               <div><span>Ranker</span><strong>Lexical cosine-lite</strong></div>
             </div>
-          </article>
-          <article>
-            <div class="panel-header inline">
-              <span>Embedding Model</span>
-              <code>local lexical</code>
-            </div>
-            <div class="empty-state compact">
-              <Database size={26} />
-              <span>Embeddings endpoint remains planned; retrieval is functional with deterministic lexical ranking.</span>
-            </div>
-          </article>
+            {#if retrievalResults.length === 0}
+              <div class="empty-state compact">
+                <Search size={26} />
+                <span>Run a query to inspect the top 5 ranked chunks with similarity scores.</span>
+              </div>
+            {:else}
+              <div class="retrieval-results">
+                {#each retrievalResults.slice(0, 5) as result}
+                  <article>
+                    <div class="panel-header inline">
+                      <span>{result.documentName} / #{result.chunkIndex + 1}</span>
+                      <code>{formatNumber(result.score * 100, 0)}%</code>
+                    </div>
+                    <i><b style={`width: ${result.score * 100}%`}></b></i>
+                    <p>{result.snippet}</p>
+                  </article>
+                {/each}
+              </div>
+            {/if}
+          </aside>
         </section>
-
-        <section class="retrieval-dock">
-          <input
-            placeholder="Test retrieval query..."
-            bind:value={retrievalQuery}
-            onkeydown={(event) => {
-              if (event.key === "Enter") void runRetrievalTest();
-            }}
-          />
-          <button class="tool-button" disabled={knowledgeBusy || !retrievalQuery.trim()} onclick={runRetrievalTest}>Run retrieval</button>
-        </section>
-        {#if retrievalResults.length > 0}
-          <section class="retrieval-results">
-            {#each retrievalResults as result}
-              <article>
-                <div class="panel-header inline">
-                  <span>{result.documentName}</span>
-                  <code>{formatNumber(result.score * 100, 0)}%</code>
-                </div>
-                <p>{result.snippet}</p>
-              </article>
-            {/each}
-          </section>
-        {/if}
       {:else if activeView === "agents"}
         <section class="workspace-header">
           <div>
@@ -2959,7 +3080,6 @@
   .runtime-panel,
   .distribution-panel,
   .schema-editor > div,
-  .rag-grid article,
   .api-dashboard,
   .log-console {
     border: 1px solid var(--border);
@@ -3502,7 +3622,7 @@
     line-height: 1.6;
   }
 
-  .rag-grid article {
+  .rag-workbench > * {
     min-height: 300px;
     padding: 14px;
   }
@@ -3520,7 +3640,7 @@
     gap: 8px;
   }
 
-  .document-list div,
+  .document-list button,
   .retrieval-results article,
   .rag-metric-grid div {
     padding: 10px;
@@ -3558,7 +3678,7 @@
     line-height: 1.55;
   }
 
-  .retrieval-dock,
+  .retrieval-query,
   .api-url {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
@@ -4246,7 +4366,7 @@
   .model-import-box > div,
   .kb-create-row,
   .api-url,
-  .retrieval-dock {
+  .retrieval-query {
     border-color: var(--border-default);
     border-radius: var(--radius-sm);
     background: var(--bg-elevated);
@@ -4255,7 +4375,7 @@
   .history-item,
   .model-mini,
   .endpoint-row,
-  .document-list div,
+  .document-list button,
   .retrieval-results article,
   .rag-metric-grid div,
   .load-plan,
@@ -4693,12 +4813,12 @@
     font-size: 11px;
   }
 
-  .rag-grid,
+  .rag-workbench,
   .knowledge-workbench {
     padding: 14px;
   }
 
-  .rag-grid article {
+  .rag-workbench > * {
     min-height: 260px;
     border-radius: var(--radius-md);
   }
@@ -4723,7 +4843,7 @@
     }
 
     .blueprint-grid,
-    .rag-grid,
+    .rag-workbench,
     .api-config-grid,
     .load-plan-grid,
     .allocation-grid,
@@ -5161,16 +5281,235 @@
     font-size: var(--text-xs);
   }
 
+  .document-tree-list {
+    display: grid;
+    gap: 4px;
+  }
+
+  .document-tree-list button {
+    min-height: 30px;
+    display: grid;
+    grid-template-columns: 16px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 8px;
+    padding: 0 8px;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    color: var(--text-secondary);
+    background: transparent;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .document-tree-list button:hover,
+  .document-tree-list button.active {
+    color: var(--text-primary);
+    background: var(--bg-elevated);
+  }
+
+  .document-tree-list span,
+  .document-tree-list code {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .rag-workbench {
+    min-height: 0;
+    display: grid;
+    grid-template-columns: 220px minmax(0, 1fr) 260px;
+    gap: 0;
+    margin: 14px;
+    padding: 0;
+    border: 1px solid var(--border-default);
+    background: var(--bg-panel);
+  }
+
+  .rag-doc-tree,
+  .chunk-browser,
+  .retrieval-panel {
+    min-width: 0;
+    min-height: 0;
+    display: grid;
+    grid-template-rows: auto minmax(0, 1fr);
+    align-content: start;
+    gap: 10px;
+    padding: 12px;
+    border-radius: 0;
+    background: var(--bg-panel);
+  }
+
+  .chunk-browser,
+  .retrieval-panel {
+    border-left: 1px solid var(--border-default);
+  }
+
+  .document-list,
+  .chunk-list,
+  .retrieval-results {
+    min-height: 0;
+    display: grid;
+    align-content: start;
+    gap: 6px;
+    overflow: auto;
+  }
+
+  .document-list button {
+    min-height: 58px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 3px 8px;
+    padding: 8px;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-sm);
+    color: var(--text-secondary);
+    background: var(--bg-elevated);
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .document-list button:hover,
+  .document-list button.active {
+    border-color: var(--border-strong);
+    color: var(--text-primary);
+    background: var(--bg-active);
+  }
+
+  .document-list strong,
+  .document-list span,
+  .document-list code {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .document-list strong {
+    grid-column: 1 / -1;
+    color: var(--text-primary);
+    font-size: var(--text-sm);
+  }
+
+  .document-list span,
+  .document-list code {
+    color: var(--text-tertiary);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+  }
+
+  .chunk-row {
+    display: grid;
+    gap: 7px;
+    padding: 8px;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-sm);
+    background: var(--bg-app);
+  }
+
+  .chunk-row.active {
+    border-color: color-mix(in srgb, var(--accent-primary) 42%, var(--border-default));
+    background: color-mix(in srgb, var(--accent-primary) 8%, var(--bg-app));
+  }
+
+  .chunk-row > div,
+  .retrieval-results .panel-header.inline {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin: 0;
+  }
+
+  .chunk-row span,
+  .chunk-row code {
+    color: var(--text-tertiary);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+  }
+
+  .chunk-row p,
+  .retrieval-results p {
+    display: -webkit-box;
+    overflow: hidden;
+    margin: 0;
+    color: var(--text-secondary);
+    font-size: var(--text-xs);
+    line-height: 1.5;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 3;
+    line-clamp: 3;
+  }
+
+  .chunk-row i,
+  .retrieval-results article > i {
+    overflow: hidden;
+    height: 4px;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated);
+  }
+
+  .chunk-row i b,
+  .retrieval-results article > i b {
+    display: block;
+    height: 100%;
+    background: var(--accent-primary);
+  }
+
+  .retrieval-panel {
+    grid-template-rows: auto auto auto minmax(0, 1fr);
+  }
+
+  .retrieval-query {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 64px;
+    gap: 8px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+  }
+
+  .rag-metric-grid {
+    grid-template-columns: 1fr;
+    gap: 6px;
+  }
+
+  .rag-metric-grid div {
+    min-height: 42px;
+    display: grid;
+    gap: 2px;
+    padding: 7px 8px;
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated);
+  }
+
+  .retrieval-results article {
+    display: grid;
+    gap: 7px;
+    padding: 8px;
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated);
+  }
+
+  .retrieval-results .panel-header.inline span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
   @media (max-width: 1439px) {
     .telemetry-board,
     .agent-workbench,
-    .api-split {
+    .api-split,
+    .rag-workbench {
       grid-template-columns: 1fr;
     }
 
     .agent-detail,
     .tool-schema-list,
-    .api-example {
+    .api-example,
+    .chunk-browser,
+    .retrieval-panel {
       border-left: 0;
       border-top: 1px solid var(--border-default);
     }
@@ -5183,6 +5522,7 @@
   @media (max-width: 1279px) {
     .telemetry-board,
     .agent-workbench,
+    .rag-workbench,
     .api-dashboard,
     .benchmark-metrics,
     .benchmark-bars {
