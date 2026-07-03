@@ -1,0 +1,37 @@
+name: Feature request
+description: Suggest a focused improvement for Kivarro.
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What workflow or limitation should this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior and UI/API surface you expect.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Command Center
+        - Model Registry
+        - Hardware Fit
+        - Expert Tuning
+        - Knowledge Base / RAG
+        - Agents
+        - Local API
+        - Benchmarks
+        - System Logs
+        - Settings
+        - Packaging / Distribution
+    validations:
+      required: true

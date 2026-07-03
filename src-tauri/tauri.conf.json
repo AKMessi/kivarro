@@ -15,8 +15,8 @@
         "title": "Kivarro",
         "width": 1440,
         "height": 940,
-        "minWidth": 980,
-        "minHeight": 700,
+        "minWidth": 900,
+        "minHeight": 720,
         "decorations": false
       }
     ],

@@ -4,6 +4,8 @@ node_modules
 /.svelte-kit
 /package
 /src-tauri/target
+/models
+/src-tauri/models
 .env
 .env.*
 !.env.example

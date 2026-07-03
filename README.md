@@ -1,11 +1,13 @@
 # Kivarro
 
-Kivarro is a Rust/Tauri local model inference workstation for Windows, macOS, and Linux. The current baseline establishes the desktop shell, typed Rust command surface, model discovery foundation, and a dense command-center UI inspired by high-end instrumentation software.
+Kivarro is a Rust/Tauri local model inference workstation for Windows, macOS, and Linux. It is built for running, tuning, inspecting, and serving private local AI models from a desktop cockpit UI.
 
-## Current baseline
+> License note: Kivarro is source-available for non-commercial use under the PolyForm Noncommercial License 1.0.0. This is not an OSI open-source license because commercial use is restricted.
+
+## Status
 
 - Tauri v2 desktop app with SvelteKit and TypeScript.
-- Engineering Cockpit UI shell with dense nav rail, contextual panel, workspace, inspector, status bar, and strict design tokens.
+- Precision-instrument UI shell with dense nav rail, contextual panel, workspace, inspector, status bar, and strict design tokens.
 - Implemented views for Command Center, Model Registry, Hardware Fit, Expert Tuning, RAG Knowledge Bases, Agents, Local API, Benchmarks, Logs, and Settings.
 - Rust commands for CPU/RAM telemetry, local model discovery/import under `./models`, GGUF metadata indexing, API endpoint metadata, logs, and persisted benchmark result surfaces.
 - Cross-platform accelerator discovery with NVIDIA SMI live utilization/VRAM telemetry and OS fallbacks for Windows, macOS, and Linux GPU inventory.
@@ -20,6 +22,19 @@ Kivarro is a Rust/Tauri local model inference workstation for Windows, macOS, an
 - Browser-preview fallbacks for UI smoke testing outside Tauri.
 - Windows ARM64 release bundling verified with MSI and NSIS outputs.
 
+## License
+
+Kivarro is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE). You may use, modify, and distribute it for permitted non-commercial purposes. For commercial use, contact the repository owner.
+
+The license text is from the PolyForm Project: <https://polyformproject.org/licenses/noncommercial/1.0.0>.
+
+## Prerequisites
+
+- Node.js 20 or newer
+- Rust stable
+- Tauri v2 system prerequisites for your operating system
+- Optional for real inference: `llama-server` from llama.cpp or `mistralrs`
+
 ## Development
 
 ```bash
@@ -27,6 +42,12 @@ npm install
 npm run check
 npm run build
 npm run tauri dev
+```
+
+For browser-only UI work:
+
+```bash
+npm run dev -- --host 127.0.0.1 --port 4173
 ```
 
 ## Verification
@@ -44,9 +65,17 @@ The browser preview can be checked with:
 npm run preview -- --host 127.0.0.1 --port 4173
 ```
 
+Before publishing a release, verify the UI at:
+
+- `1440x900`
+- `1280x720`
+- `900x720`
+
 ## Model files
 
 Place local model files under `./models`, or paste a model file path into Model Registry to copy it into the local library. The scanner recognizes `.gguf`, `.safetensors`, `.bin`, and `.mlx` files. GGUF files are indexed directly from the file header and metadata block for architecture, quantization, tensor count, context length, and transformer block count without loading tensor payloads.
+
+Model binaries are intentionally ignored by git. Do not commit local models, private prompts, imported documents, generated installers, logs, or `.env` files.
 
 ## Local engines
 
@@ -85,10 +114,15 @@ Kivarro seeds four default profiles on first launch:
 
 Profiles are saved as `.kivarro.json` files through the Tauri backend. The profile schema includes system prompt, sampling controls, runtime controls, and output constraints.
 
-## Next engineering milestones
+## Contributing
 
-- Deeper `mistral.rs` runtime flag mapping for GPU, quantization, and context controls.
-- GPU vendor-specific utilization adapters beyond NVIDIA SMI.
-- Built-in OpenAI-compatible proxy/server for external clients.
-- Embedding-backed vector indexing and citation injection for RAG.
-- Benchmark CSV export and comparison filters.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Security-sensitive reports should follow [SECURITY.md](SECURITY.md).
+
+## Public Release Checklist
+
+- `npm run check`
+- `npm run build`
+- `cargo check --manifest-path src-tauri/Cargo.toml`
+- `npm run tauri build`
+- Confirm no local model files or generated bundles are staged.
+- Confirm package, Cargo, README, and license metadata all match `PolyForm-Noncommercial-1.0.0`.

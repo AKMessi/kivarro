@@ -1,0 +1,48 @@
+name: Bug report
+description: Report a reproducible Kivarro bug.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not attach model files, private prompts, private documents, API keys, or sensitive logs.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest reliable reproduction.
+      placeholder: |
+        1. Open ...
+        2. Select ...
+        3. Click ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include OS, architecture, Kivarro commit/version, backend, and model format if relevant.
+      placeholder: "Windows 11 ARM64, Kivarro commit ..., llama.cpp, GGUF"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Sanitized logs or screenshots
+      description: Paste only sanitized logs. Remove local paths and private data.
+    validations:
+      required: false
