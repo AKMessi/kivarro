@@ -48,11 +48,22 @@ jobs:
       - name: Install npm dependencies
         run: npm ci
 
+      - name: Install Playwright browser
+        if: runner.os != 'Linux'
+        run: npx playwright install chromium
+
+      - name: Install Playwright browser and Linux dependencies
+        if: runner.os == 'Linux'
+        run: npx playwright install --with-deps chromium
+
       - name: Svelte check
         run: npm run check
 
       - name: Frontend build
         run: npm run build
+
+      - name: UI smoke tests
+        run: npm run test:ui
 
       - name: Rust fmt
         run: cargo fmt --manifest-path src-tauri/Cargo.toml -- --check

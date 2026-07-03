@@ -53,6 +53,7 @@ npm run dev -- --host 127.0.0.1 --port 4173
 
 ```bash
 npm run check:all
+npm run test:ui
 npm run tauri build
 ```
 
@@ -118,6 +119,7 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Security-
 ## Public Release Checklist
 
 - `npm run check:all`
+- `npm run test:ui`
 - `npm run tauri build`
 - Confirm no local model files or generated bundles are staged.
 - Confirm package, Cargo, README, and license metadata all match `PolyForm-Noncommercial-1.0.0`.

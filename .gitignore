@@ -3,7 +3,9 @@ node_modules
 /build
 /.svelte-kit
 /package
+/playwright-report
 /src-tauri/target
+/test-results
 /models
 /src-tauri/models
 .env

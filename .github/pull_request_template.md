@@ -10,6 +10,7 @@
 - [ ] `cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings`
 - [ ] `cargo check --manifest-path src-tauri/Cargo.toml`
 - [ ] `cargo test --manifest-path src-tauri/Cargo.toml`
+- [ ] `npm run test:ui`
 
 ## Risk
 
