@@ -4,7 +4,6 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import {
     Activity,
-    BookOpen,
     Bot,
     Boxes,
     BrainCircuit,
@@ -18,10 +17,10 @@
     Gauge,
     HardDrive,
     Layers3,
+    MessageSquare,
     Maximize2,
     Minus,
     Moon,
-    Network,
     PanelLeftClose,
     PanelRightClose,
     Play,
@@ -31,7 +30,6 @@
     Server,
     Settings,
     SlidersHorizontal,
-    ScrollText,
     Split,
     Sun,
     Terminal,
@@ -113,15 +111,15 @@
   };
 
   const navItems: NavItem[] = [
-    { id: "command", label: "Command Center", icon: Terminal },
-    { id: "models", label: "Model Registry", icon: Database },
+    { id: "command", label: "Command Center", icon: MessageSquare },
+    { id: "models", label: "Model Registry", icon: Boxes },
     { id: "hardware", label: "Hardware Fit", icon: Cpu },
     { id: "tuning", label: "Expert Tuning", icon: SlidersHorizontal },
-    { id: "knowledge", label: "Knowledge Base", icon: BookOpen },
+    { id: "knowledge", label: "Knowledge Base", icon: Database },
     { id: "agents", label: "Agents", icon: Bot },
-    { id: "api", label: "Local API", icon: Network },
+    { id: "api", label: "Local API", icon: Server },
     { id: "benchmarks", label: "Benchmarks", icon: Gauge },
-    { id: "logs", label: "System Logs", icon: ScrollText },
+    { id: "logs", label: "System Logs", icon: Terminal },
     { id: "settings", label: "Settings", icon: Settings },
   ];
 
@@ -448,7 +446,7 @@
         label: "Refresh system logs",
         detail: `${logs.length} entries loaded`,
         keywords: ["logs", "refresh", "system", "debug"],
-        icon: ScrollText,
+        icon: Terminal,
         run: refreshLogs,
       },
     ];
@@ -1034,46 +1032,54 @@
 
 <div class="app">
   <header class="titlebar" data-tauri-drag-region>
-    <div class="window-controls">
-      <button aria-label="Close window" class="window-control close" onclick={closeWindow}>
-        <X size={12} />
-      </button>
-      <button aria-label="Minimize window" class="window-control minimize" onclick={minimizeWindow}>
-        <Minus size={12} />
-      </button>
-      <button aria-label="Maximize window" class="window-control maximize" onclick={toggleMaximizeWindow}>
-        <Maximize2 size={11} />
-      </button>
-    </div>
-
     <div class="title-identity" data-tauri-drag-region>
-      <span class="wordmark">Kivarro</span>
-      <span class="title-divider"></span>
-      <span class="active-view">{activeMeta.label}</span>
-      <button class="title-command" data-tauri-drag-region="false" onclick={toggleCommandPalette}>
-        <Search size={13} />
-        <span>Command / action</span>
-        <code>Ctrl K</code>
-      </button>
+      <span class="brand-lockup">
+        <BrainCircuit size={16} strokeWidth={1.8} />
+        <span class="wordmark">Kivarro</span>
+      </span>
+      <span class="title-model">
+        <span>{metrics?.activeModel ?? selectedModel?.name ?? "No model loaded"}</span>
+        <code>{formatTokens(metrics?.contextUsedTokens ?? 0)} / {formatTokens(metrics?.contextTotalTokens ?? sampling.contextLength)} ctx</code>
+        <i class="title-context-meter"><b style={`width: ${contextPercent}%`}></b></i>
+      </span>
     </div>
 
-    <div class="quick-actions">
-      <button class="icon-button" aria-label="Toggle left panel" title="Toggle left panel" onclick={() => (leftCollapsed = !leftCollapsed)}>
-        <PanelLeftClose size={16} />
-      </button>
-      <button class="icon-button" aria-label="Command palette" title="Cmd/Ctrl + K" onclick={toggleCommandPalette}>
-        <Search size={16} />
-      </button>
-      <button class="icon-button" aria-label="Toggle theme" title="Toggle theme" onclick={toggleTheme}>
-        {#if theme === "dark"}
-          <Moon size={16} />
-        {:else}
-          <Sun size={16} />
-        {/if}
-      </button>
-      <button class="icon-button" aria-label="Toggle inspector" title="Toggle inspector" onclick={() => (rightCollapsed = !rightCollapsed)}>
-        <PanelRightClose size={16} />
-      </button>
+    <button class="title-command" data-tauri-drag-region="false" onclick={toggleCommandPalette}>
+      <Search size={13} />
+      <span>Command / action</span>
+      <code>Ctrl K</code>
+    </button>
+
+    <div class="title-actions" data-tauri-drag-region>
+      <div class="quick-actions" data-tauri-drag-region="false">
+        <button class="icon-button" aria-label="Toggle left panel" title="Toggle left panel" onclick={() => (leftCollapsed = !leftCollapsed)}>
+          <PanelLeftClose size={16} />
+        </button>
+        <button class="icon-button" aria-label="Command palette" title="Cmd/Ctrl + K" onclick={toggleCommandPalette}>
+          <Search size={16} />
+        </button>
+        <button class="icon-button" aria-label="Toggle theme" title="Toggle theme" onclick={toggleTheme}>
+          {#if theme === "dark"}
+            <Moon size={16} />
+          {:else}
+            <Sun size={16} />
+          {/if}
+        </button>
+        <button class="icon-button" aria-label="Toggle inspector" title="Toggle inspector" onclick={() => (rightCollapsed = !rightCollapsed)}>
+          <PanelRightClose size={16} />
+        </button>
+      </div>
+      <div class="window-controls" data-tauri-drag-region="false">
+        <button aria-label="Minimize window" class="window-control minimize" onclick={minimizeWindow}>
+          <Minus size={12} />
+        </button>
+        <button aria-label="Maximize window" class="window-control maximize" onclick={toggleMaximizeWindow}>
+          <Maximize2 size={11} />
+        </button>
+        <button aria-label="Close window" class="window-control close" onclick={closeWindow}>
+          <X size={12} />
+        </button>
+      </div>
     </div>
   </header>
 
@@ -1093,12 +1099,12 @@
             title={item.label}
             onclick={() => setActiveView(item.id)}
           >
-            <svelte:component this={item.icon} size={18} strokeWidth={1.8} />
+            <svelte:component this={item.icon} size={24} strokeWidth={1.7} />
           </button>
         {/each}
       </div>
       <button class="rail-button monitor" aria-label="Hardware status monitor" title="Hardware status">
-        <Activity size={18} strokeWidth={1.8} />
+        <Activity size={24} strokeWidth={1.7} />
       </button>
     </nav>
 
@@ -2354,16 +2360,6 @@
     text-transform: uppercase;
   }
 
-  .title-divider {
-    width: 1px;
-    height: 14px;
-    background: var(--border-strong);
-  }
-
-  .active-view {
-    color: var(--muted);
-  }
-
   .icon-button {
     width: 28px;
     height: 26px;
@@ -2388,20 +2384,20 @@
   .shell {
     min-height: 0;
     display: grid;
-    grid-template-columns: 56px 280px minmax(0, 1fr) 320px;
+    grid-template-columns: 64px 280px minmax(0, 1fr) 320px;
     transition: grid-template-columns 160ms ease;
   }
 
   .shell.left-collapsed {
-    grid-template-columns: 56px 0 minmax(0, 1fr) 320px;
+    grid-template-columns: 64px 0 minmax(0, 1fr) 320px;
   }
 
   .shell.right-collapsed {
-    grid-template-columns: 56px 280px minmax(0, 1fr) 0;
+    grid-template-columns: 64px 280px minmax(0, 1fr) 0;
   }
 
   .shell.left-collapsed.right-collapsed {
-    grid-template-columns: 56px 0 minmax(0, 1fr) 0;
+    grid-template-columns: 64px 0 minmax(0, 1fr) 0;
   }
 
   .nav-rail,
@@ -2946,7 +2942,7 @@
 
   .context-meter {
     height: 8px;
-    border-radius: 999px;
+    border-radius: var(--radius-sm);
   }
 
   .context-meter span,
@@ -3036,7 +3032,7 @@
     gap: 12px;
     align-items: center;
     min-height: 42px;
-    min-width: 860px;
+    min-width: 0;
     padding: 0 12px;
     border-bottom: 1px solid var(--border);
     font-size: 13px;
@@ -3255,10 +3251,33 @@
     align-items: center;
   }
 
-  .runtime-grid input[type="checkbox"] {
+  input[type="checkbox"] {
+    appearance: none;
     width: 18px;
     height: 18px;
-    accent-color: var(--amber);
+    display: grid;
+    place-items: center;
+    padding: 0;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated);
+    cursor: pointer;
+  }
+
+  input[type="checkbox"]::after {
+    content: "";
+    width: 8px;
+    height: 8px;
+    background: transparent;
+  }
+
+  input[type="checkbox"]:checked {
+    border-color: var(--accent-primary);
+    background: color-mix(in srgb, var(--accent-primary) 18%, var(--bg-elevated));
+  }
+
+  input[type="checkbox"]:checked::after {
+    background: var(--accent-primary);
   }
 
   .control-band > div,
@@ -3268,9 +3287,41 @@
   }
 
   input[type="range"] {
-    height: 4px;
+    appearance: none;
+    height: 18px;
     padding: 0;
-    accent-color: var(--amber);
+    background: transparent;
+    cursor: pointer;
+  }
+
+  input[type="range"]::-webkit-slider-runnable-track {
+    height: 2px;
+    border: 1px solid var(--border-default);
+    background: var(--bg-elevated);
+  }
+
+  input[type="range"]::-webkit-slider-thumb {
+    appearance: none;
+    width: 12px;
+    height: 12px;
+    margin-top: -6px;
+    border: 1px solid color-mix(in srgb, var(--accent-primary) 60%, var(--border-strong));
+    border-radius: var(--radius-sm);
+    background: var(--accent-primary);
+  }
+
+  input[type="range"]::-moz-range-track {
+    height: 2px;
+    border: 1px solid var(--border-default);
+    background: var(--bg-elevated);
+  }
+
+  input[type="range"]::-moz-range-thumb {
+    width: 12px;
+    height: 12px;
+    border: 1px solid color-mix(in srgb, var(--accent-primary) 60%, var(--border-strong));
+    border-radius: var(--radius-sm);
+    background: var(--accent-primary);
   }
 
   .tuning-grid {
@@ -3684,7 +3735,8 @@
     position: fixed;
     inset: 0;
     border: 0;
-    background: rgba(0, 0, 0, 0.24);
+    background: color-mix(in srgb, var(--bg-app) 72%, transparent);
+    backdrop-filter: blur(6px);
     cursor: default;
   }
 
@@ -3692,13 +3744,13 @@
     position: fixed;
     top: 64px;
     left: 50%;
-    width: min(640px, calc(100vw - 80px));
+    width: min(600px, calc(100vw - 48px));
+    max-height: 400px;
     transform: translateX(-50%);
     overflow: hidden;
     border: 1px solid var(--border-strong);
-    border-radius: 8px;
+    border-radius: var(--radius-md);
     background: var(--panel);
-    box-shadow: 0 22px 80px rgba(0, 0, 0, 0.4);
   }
 
   .palette-input {
@@ -3783,8 +3835,10 @@
   }
 
 
-  /* Engineering Cockpit revamp layer */
+  /* Precision Instrumentation & Tactile Calm layer */
   .app {
+    min-width: 900px;
+    min-height: 720px;
     grid-template-rows: 40px minmax(0, 1fr) 24px;
     background: var(--bg-app);
     color: var(--text-primary);
@@ -3792,28 +3846,67 @@
   }
 
   .titlebar {
-    grid-template-columns: 132px minmax(0, 1fr) 180px;
+    grid-template-columns: minmax(320px, 0.85fr) minmax(320px, 600px) minmax(300px, 0.85fr);
     height: 40px;
     border-bottom: 1px solid var(--border-default);
-    background: color-mix(in srgb, var(--bg-app) 96%, transparent);
+    background: var(--bg-app);
   }
 
   .window-controls,
   .quick-actions {
-    gap: 6px;
-    padding: 0 10px;
+    gap: 4px;
+    padding: 0;
+  }
+
+  .title-actions {
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 12px;
+    padding: 0 10px 0 0;
   }
 
   .window-control {
-    width: 12px;
-    height: 12px;
+    width: 28px;
+    height: 24px;
+    border-radius: var(--radius-sm);
+    color: var(--text-secondary);
+    background: transparent;
+  }
+
+  .window-control.close,
+  .window-control.minimize,
+  .window-control.maximize {
+    background: transparent;
+  }
+
+  .window-control:hover {
+    color: var(--text-primary);
+    background: var(--bg-elevated);
+  }
+
+  .window-control.close:hover {
+    color: var(--bg-app);
+    background: var(--accent-danger);
   }
 
   .title-identity {
+    min-width: 0;
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: center;
     justify-content: flex-start;
-    gap: 10px;
-    padding: 0 8px;
+    gap: 14px;
+    padding: 0 12px;
     font-size: var(--text-xs);
+  }
+
+  .brand-lockup {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--accent-primary);
   }
 
   .wordmark {
@@ -3824,24 +3917,49 @@
     letter-spacing: 0.2em;
   }
 
-  .title-divider {
-    background: var(--border-strong);
-  }
-
-  .active-view {
-    flex: 0 0 auto;
-    color: var(--text-tertiary);
+  .title-model {
+    min-width: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 8px;
+    color: var(--text-secondary);
     font-family: var(--font-mono);
   }
 
+  .title-model > span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .title-model code {
+    color: var(--text-tertiary);
+    font-size: 10px;
+  }
+
+  .title-context-meter {
+    grid-column: 1 / -1;
+    overflow: hidden;
+    height: 2px;
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated);
+  }
+
+  .title-context-meter b {
+    display: block;
+    height: 100%;
+    background: var(--accent-primary);
+  }
+
   .title-command {
-    width: min(420px, 38vw);
-    height: 26px;
+    justify-self: center;
+    width: min(600px, 100%);
+    height: 28px;
     display: grid;
     grid-template-columns: 18px minmax(0, 1fr) auto;
     align-items: center;
     gap: 7px;
-    margin-left: 12px;
     padding: 0 8px;
     border: 1px solid var(--border-default);
     border-radius: var(--radius-sm);
@@ -3860,7 +3978,7 @@
   .title-command code {
     padding: 1px 5px;
     border: 1px solid var(--border-default);
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     color: var(--text-secondary);
     font-family: var(--font-mono);
     font-size: 10px;
@@ -3868,7 +3986,7 @@
 
   .icon-button {
     width: 28px;
-    height: 26px;
+    height: 24px;
     border-radius: var(--radius-sm);
     color: var(--text-tertiary);
   }
@@ -3879,28 +3997,28 @@
   }
 
   .shell {
-    grid-template-columns: 48px 240px minmax(0, 1fr) 320px;
+    grid-template-columns: 64px 280px minmax(0, 1fr) 320px;
     background: var(--bg-app);
     transition: grid-template-columns 120ms ease;
   }
 
   .shell.left-collapsed {
-    grid-template-columns: 48px 0 minmax(0, 1fr) 320px;
+    grid-template-columns: 64px 0 minmax(0, 1fr) 320px;
   }
 
   .shell.right-collapsed {
-    grid-template-columns: 48px 240px minmax(0, 1fr) 0;
+    grid-template-columns: 64px 280px minmax(0, 1fr) 0;
   }
 
   .shell.left-collapsed.right-collapsed {
-    grid-template-columns: 48px 0 minmax(0, 1fr) 0;
+    grid-template-columns: 64px 0 minmax(0, 1fr) 0;
   }
 
   .shell.wide-workspace,
   .shell.wide-workspace.left-collapsed,
   .shell.wide-workspace.right-collapsed,
   .shell.wide-workspace.left-collapsed.right-collapsed {
-    grid-template-columns: 48px 0 minmax(0, 1fr) 0;
+    grid-template-columns: 64px 0 minmax(0, 1fr) 0;
   }
 
   .shell.wide-workspace .context-panel,
@@ -3917,7 +4035,8 @@
   }
 
   .nav-rail {
-    padding: 6px 0;
+    width: 64px;
+    padding: 8px 0;
   }
 
   .rail-stack {
@@ -3926,18 +4045,20 @@
 
   .rail-button {
     position: relative;
-    width: 40px;
-    height: 34px;
-    border-radius: var(--radius-sm);
+    width: 64px;
+    height: 40px;
+    border-width: 0 0 0 2px;
+    border-radius: 0;
+    border-left-color: transparent;
     color: var(--text-tertiary);
   }
 
   .rail-button::before {
     content: "";
     position: absolute;
-    inset: 7px auto 7px 0;
+    inset: 8px auto 8px 0;
     width: 2px;
-    border-radius: 2px;
+    border-radius: 0;
     background: transparent;
   }
 
@@ -3948,7 +4069,8 @@
 
   .rail-button.active {
     color: var(--accent-primary);
-    background: var(--bg-active);
+    border-left-color: var(--accent-primary);
+    background: var(--bg-elevated);
   }
 
   .rail-button.active::before {
@@ -4166,7 +4288,6 @@
   .model-status-dot.online-dot {
     border-color: color-mix(in srgb, var(--accent-primary) 64%, var(--border-default));
     background: var(--accent-primary);
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-primary) 13%, transparent);
   }
 
   .quant-badge {
@@ -4328,7 +4449,7 @@
   }
 
   .prompt-tools input[type="range"] {
-    height: auto;
+    height: 18px;
     padding: 0;
   }
 
@@ -4373,7 +4494,6 @@
     border-color: var(--border-strong);
     border-radius: var(--radius-md);
     background: var(--bg-panel);
-    box-shadow: 0 24px 80px rgba(0, 0, 0, 0.46);
   }
 
   .palette-input,
@@ -4423,13 +4543,13 @@
     display: inline-block;
     margin-right: 8px;
     border-radius: var(--radius-pill);
+    border: 1px solid color-mix(in srgb, var(--accent-danger) 42%, var(--border-default));
     background: var(--accent-danger);
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-danger) 14%, transparent);
   }
 
   .api-dashboard.online::before {
+    border-color: color-mix(in srgb, var(--accent-primary) 46%, var(--border-default));
     background: var(--accent-primary);
-    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-primary) 14%, transparent);
   }
 
   .curl-block {
@@ -4570,9 +4690,9 @@
     right: -5px;
   }
 
-  @media (max-width: 1200px) {
+  @media (max-width: 1439px) {
     .shell {
-      grid-template-columns: 48px 240px minmax(0, 1fr) 0;
+      grid-template-columns: 64px 280px minmax(0, 1fr) 0;
     }
 
     .inspector {
@@ -4615,18 +4735,19 @@
     }
   }
 
-  @media (max-width: 900px) {
+  @media (max-width: 1279px) {
     .titlebar {
-      grid-template-columns: 96px minmax(0, 1fr) 140px;
+      grid-template-columns: minmax(220px, 0.9fr) minmax(260px, 1fr) minmax(160px, auto);
     }
 
-    .title-command {
+    .title-model code,
+    .title-context-meter {
       display: none;
     }
 
     .shell,
     .shell.right-collapsed {
-      grid-template-columns: 48px 0 minmax(0, 1fr) 0;
+      grid-template-columns: 64px 0 minmax(0, 1fr) 0;
     }
 
     .context-panel,

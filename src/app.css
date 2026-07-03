@@ -14,23 +14,23 @@
   --text-md: 14px;
   --text-lg: 16px;
   --text-xl: 20px;
-  --radius-sm: 4px;
-  --radius-md: 6px;
+  --radius-sm: 2px;
+  --radius-md: 4px;
   --radius-pill: 999px;
 
-  --bg-app: #0a0a0b;
-  --bg-panel: #111113;
-  --bg-elevated: #18181b;
-  --bg-active: #1f1f23;
-  --border-default: #27272a;
-  --border-strong: #3f3f46;
-  --text-primary: #e4e4e7;
-  --text-secondary: #a1a1aa;
-  --text-tertiary: #71717a;
-  --accent-primary: #10b981;
-  --accent-warning: #f59e0b;
-  --accent-danger: #ef4444;
-  --accent-info: #38bdf8;
+  --bg-app: #0a0b0e;
+  --bg-panel: #111317;
+  --bg-elevated: #181b21;
+  --bg-active: #1d222b;
+  --border-default: #1f222a;
+  --border-strong: #2c303a;
+  --text-primary: #e4e6eb;
+  --text-secondary: #8b909c;
+  --text-tertiary: #4a4e57;
+  --accent-primary: #22d3ee;
+  --accent-warning: #fbbf24;
+  --accent-danger: #f87171;
+  --accent-info: #22d3ee;
 
   color: var(--text-primary);
   background: var(--bg-app);
@@ -58,10 +58,12 @@
   --bg-elevated: #f1f3f5;
   --bg-active: #e9ecef;
   --border-default: #dee2e6;
-  --border-strong: #adb5bd;
-  --text-primary: #111827;
-  --text-secondary: #4b5563;
-  --text-tertiary: #9ca3af;
+  --border-strong: #ced4da;
+  --text-primary: #111317;
+  --text-secondary: #495057;
+  --text-tertiary: #adb5bd;
+  --accent-primary: #0e7490;
+  --accent-info: #0e7490;
   color: var(--text-primary);
   background: var(--bg-app);
 }
@@ -81,12 +83,9 @@ body,
 }
 
 body {
-  min-width: 860px;
-  background:
-    linear-gradient(90deg, rgba(255, 255, 255, 0.025) 1px, transparent 1px),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.018) 1px, transparent 1px),
-    var(--bg-app);
-  background-size: 48px 48px;
+  min-width: 900px;
+  min-height: 720px;
+  background: var(--bg-app);
 }
 
 button,
@@ -105,9 +104,7 @@ input:focus-visible,
 textarea:focus-visible,
 select:focus-visible {
   outline: 0;
-  box-shadow:
-    0 0 0 2px var(--bg-panel),
-    0 0 0 4px var(--accent-info);
+  box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--accent-info) 50%, transparent);
 }
 
 ::placeholder {
@@ -131,7 +128,7 @@ select:focus-visible {
 ::-webkit-scrollbar-thumb {
   background: color-mix(in srgb, var(--text-tertiary) 42%, transparent);
   border: 3px solid transparent;
-  border-radius: var(--radius-pill);
+  border-radius: var(--radius-sm);
   background-clip: content-box;
 }
 
