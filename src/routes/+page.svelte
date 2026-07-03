@@ -92,6 +92,16 @@
     icon: typeof Activity;
   };
 
+  type PaletteAction = {
+    id: string;
+    label: string;
+    detail: string;
+    keywords: string[];
+    icon: typeof Activity;
+    disabled?: boolean;
+    run: () => void | Promise<void>;
+  };
+
   type ChatMessage = {
     id: string;
     role: "user" | "assistant" | "system";
@@ -132,6 +142,8 @@
   let leftCollapsed = false;
   let rightCollapsed = false;
   let commandPaletteOpen = false;
+  let paletteQuery = "";
+  let paletteInput: HTMLInputElement | null = null;
   let splitView = false;
   let promptText = "";
   let selectedProfileId = fallbackProfiles[0].id;
@@ -171,6 +183,8 @@
   let retrievalResults: RetrievalMatch[] = [];
 
   let sampling = controlsFromProfile(fallbackProfiles[0]);
+  let paletteActions: PaletteAction[] = [];
+  let filteredPaletteActions: PaletteAction[] = [];
 
   let chatMessages: ChatMessage[] = [
     {
@@ -223,6 +237,8 @@
   $: engineOnline = engineStatus?.state === "ready";
   $: engineLoading = engineStatus?.state === "loading";
   $: apiEndpointLocked = engineOnline || engineLoading || Boolean(apiStatus?.enabled);
+  $: paletteActions = buildPaletteActions();
+  $: filteredPaletteActions = paletteActions.filter((action) => paletteMatches(action, paletteQuery)).slice(0, 14);
   $: engineLabel = engineBusy
     ? "Starting"
     : engineOnline
@@ -249,12 +265,12 @@
     }
 
     const refreshTimer = window.setInterval(() => void refreshRuntime(), 4000);
-    const keyHandler = (event: KeyboardEvent) => {
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
-        event.preventDefault();
-        commandPaletteOpen = !commandPaletteOpen;
-      }
-    };
+      const keyHandler = (event: KeyboardEvent) => {
+        if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+          event.preventDefault();
+          toggleCommandPalette();
+        }
+      };
 
     window.addEventListener("keydown", keyHandler);
 
@@ -332,10 +348,123 @@
   function setActiveView(view: ViewId) {
     activeView = view;
     commandPaletteOpen = false;
+    paletteQuery = "";
   }
 
   function jumpToWorkspaceSection(sectionId: string) {
     document.getElementById(sectionId)?.scrollIntoView({ block: "start" });
+  }
+
+  function toggleCommandPalette() {
+    commandPaletteOpen = !commandPaletteOpen;
+    if (commandPaletteOpen) {
+      paletteQuery = "";
+      requestAnimationFrame(() => paletteInput?.focus());
+    }
+  }
+
+  function closeCommandPalette() {
+    commandPaletteOpen = false;
+    paletteQuery = "";
+  }
+
+  function buildPaletteActions(): PaletteAction[] {
+    const navigationActions = navItems.map(
+      (item): PaletteAction => ({
+        id: `view-${item.id}`,
+        label: `Open ${item.label}`,
+        detail: "Switch workspace",
+        keywords: [item.id, item.label, "view", "workspace", "open"],
+        icon: item.icon,
+        run: () => setActiveView(item.id),
+      }),
+    );
+
+    return [
+      ...navigationActions,
+      {
+        id: "theme-toggle",
+        label: theme === "dark" ? "Switch to light mode" : "Switch to dark mode",
+        detail: `Current theme: ${theme}`,
+        keywords: ["theme", "appearance", "light", "dark"],
+        icon: theme === "dark" ? Sun : Moon,
+        run: toggleTheme,
+      },
+      {
+        id: "save-profile",
+        label: "Save inference profile",
+        detail: `${activeProfile.name} -> .kivarro.json`,
+        keywords: ["save", "profile", "tuning", "json"],
+        icon: Clipboard,
+        disabled: profileSaveStatus === "Saving",
+        run: saveCurrentProfile,
+      },
+      {
+        id: "load-model",
+        label: engineOnline ? "Reload selected model" : "Load selected model",
+        detail: selectedModel?.name ?? "Select a model in Model Registry",
+        keywords: ["load", "model", "engine", "runtime"],
+        icon: Play,
+        disabled: !selectedModelId || engineBusy,
+        run: startSelectedModel,
+      },
+      {
+        id: "stop-engine",
+        label: "Stop inference engine",
+        detail: engineStatus?.message ?? "No running engine",
+        keywords: ["stop", "engine", "unload", "runtime"],
+        icon: Power,
+        disabled: !engineOnline && !engineLoading,
+        run: stopEngine,
+      },
+      {
+        id: "copy-api-url",
+        label: "Copy API base URL",
+        detail: configuredBaseUrl,
+        keywords: ["copy", "api", "url", "endpoint"],
+        icon: Clipboard,
+        run: copyBaseUrl,
+      },
+      {
+        id: "save-api-settings",
+        label: "Save API endpoint",
+        detail: `${apiSettings.host}:${apiSettings.port}`,
+        keywords: ["api", "settings", "host", "port", "save"],
+        icon: Server,
+        disabled: apiConfigBusy || apiEndpointLocked,
+        run: saveCurrentApiSettings,
+      },
+      {
+        id: "run-benchmark",
+        label: "Run benchmark",
+        detail: selectedModel?.name ?? "Select and load a model first",
+        keywords: ["benchmark", "tokens", "speed", "eval"],
+        icon: Gauge,
+        disabled: benchmarkBusy || !selectedModelId,
+        run: runModelBenchmark,
+      },
+      {
+        id: "refresh-logs",
+        label: "Refresh system logs",
+        detail: `${logs.length} entries loaded`,
+        keywords: ["logs", "refresh", "system", "debug"],
+        icon: ScrollText,
+        run: refreshLogs,
+      },
+    ];
+  }
+
+  function paletteMatches(action: PaletteAction, query: string) {
+    const normalized = query.trim().toLowerCase();
+    if (!normalized) return true;
+
+    return [action.label, action.detail, ...action.keywords].join(" ").toLowerCase().includes(normalized);
+  }
+
+  async function runPaletteAction(action: PaletteAction | undefined) {
+    if (!action || action.disabled) return;
+    closeCommandPalette();
+    await action.run();
   }
 
   function selectProfile(profileId: string) {
@@ -921,7 +1050,7 @@
       <span class="wordmark">Kivarro</span>
       <span class="title-divider"></span>
       <span class="active-view">{activeMeta.label}</span>
-      <button class="title-command" data-tauri-drag-region="false" onclick={() => (commandPaletteOpen = !commandPaletteOpen)}>
+      <button class="title-command" data-tauri-drag-region="false" onclick={toggleCommandPalette}>
         <Search size={13} />
         <span>Command / action</span>
         <code>Ctrl K</code>
@@ -932,7 +1061,7 @@
       <button class="icon-button" aria-label="Toggle left panel" title="Toggle left panel" onclick={() => (leftCollapsed = !leftCollapsed)}>
         <PanelLeftClose size={16} />
       </button>
-      <button class="icon-button" aria-label="Command palette" title="Cmd/Ctrl + K" onclick={() => (commandPaletteOpen = !commandPaletteOpen)}>
+      <button class="icon-button" aria-label="Command palette" title="Cmd/Ctrl + K" onclick={toggleCommandPalette}>
         <Search size={16} />
       </button>
       <button class="icon-button" aria-label="Toggle theme" title="Toggle theme" onclick={toggleTheme}>
@@ -2102,19 +2231,44 @@
   </footer>
 
   {#if commandPaletteOpen}
-    <button class="palette-backdrop" aria-label="Close command palette" onclick={() => (commandPaletteOpen = false)}></button>
+    <button class="palette-backdrop" aria-label="Close command palette" onclick={closeCommandPalette}></button>
     <section class="command-palette" aria-label="Command palette">
       <div class="palette-input">
         <Search size={16} />
-        <input placeholder="Navigate, load model, switch theme..." />
+        <input
+          aria-label="Command palette search"
+          placeholder="Search commands, views, and runtime actions"
+          bind:this={paletteInput}
+          bind:value={paletteQuery}
+          onkeydown={(event) => {
+            if (event.key === "Escape") {
+              event.preventDefault();
+              closeCommandPalette();
+            }
+            if (event.key === "Enter") {
+              event.preventDefault();
+              void runPaletteAction(filteredPaletteActions.find((action) => !action.disabled));
+            }
+          }}
+        />
       </div>
       <div class="palette-results">
-        {#each navItems as item}
-          <button onclick={() => setActiveView(item.id)}>
-            <svelte:component this={item.icon} size={15} />
-            <span>Open {item.label}</span>
-          </button>
-        {/each}
+        {#if filteredPaletteActions.length === 0}
+          <div class="palette-empty">[ no matching actions ]</div>
+        {:else}
+          {#each filteredPaletteActions as action}
+            <button disabled={action.disabled} onclick={() => void runPaletteAction(action)}>
+              <svelte:component this={action.icon} size={15} />
+              <span>
+                <strong>{action.label}</strong>
+                <small>{action.detail}</small>
+              </span>
+              {#if action.disabled}
+                <code>disabled</code>
+              {/if}
+            </button>
+          {/each}
+        {/if}
       </div>
     </section>
   {/if}
@@ -3569,8 +3723,9 @@
   }
 
   .palette-results button {
-    min-height: 36px;
-    display: flex;
+    min-height: 42px;
+    display: grid;
+    grid-template-columns: 22px minmax(0, 1fr) auto;
     align-items: center;
     gap: 10px;
     border: 0;
@@ -3580,10 +3735,53 @@
     cursor: pointer;
   }
 
+  .palette-results button:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+
   .palette-results button:hover {
     color: var(--text);
     background: var(--panel-2);
   }
+
+  .palette-results button span {
+    display: grid;
+    min-width: 0;
+    gap: 2px;
+  }
+
+  .palette-results button strong,
+  .palette-results button small {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .palette-results button strong {
+    color: var(--text);
+    font-size: 13px;
+  }
+
+  .palette-results button small,
+  .palette-empty {
+    color: var(--dim);
+    font-size: 11px;
+  }
+
+  .palette-results button code {
+    color: var(--dim);
+    font-size: 10px;
+    text-transform: uppercase;
+  }
+
+  .palette-empty {
+    min-height: 56px;
+    display: grid;
+    place-items: center;
+    font-family: var(--mono);
+  }
+
 
   /* Engineering Cockpit revamp layer */
   .app {
