@@ -117,10 +117,7 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Security-
 
 ## Public Release Checklist
 
-- `npm run check`
-- `npm run build`
-- `cargo check --manifest-path src-tauri/Cargo.toml`
-- `cargo test --manifest-path src-tauri/Cargo.toml`
+- `npm run check:all`
 - `npm run tauri build`
 - Confirm no local model files or generated bundles are staged.
 - Confirm package, Cargo, README, and license metadata all match `PolyForm-Noncommercial-1.0.0`.
