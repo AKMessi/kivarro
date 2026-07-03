@@ -36,6 +36,8 @@ Before opening a PR:
 
 - Run `npm run check`.
 - Run `npm run build`.
+- Run `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`.
+- Run `cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings`.
 - Run `cargo check --manifest-path src-tauri/Cargo.toml`.
 - Run `cargo test --manifest-path src-tauri/Cargo.toml`.
 - Do not commit local model files, generated installers, private logs, or `.env` files.

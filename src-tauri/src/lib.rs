@@ -941,7 +941,7 @@ fn list_models() -> Result<Vec<ModelRecord>, String> {
         collect_models(&directory, &mut models)?;
     }
 
-    models.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    models.sort_by_key(|model| model.name.to_lowercase());
     Ok(models)
 }
 
@@ -1035,7 +1035,7 @@ fn list_inference_profiles(app_handle: AppHandle) -> Result<Vec<InferenceProfile
         profiles.push(profile);
     }
 
-    profiles.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    profiles.sort_by_key(|profile| profile.name.to_lowercase());
     Ok(profiles)
 }
 
@@ -1438,7 +1438,7 @@ fn run_chat_completion_inner(
     let requested_model_id = canonical_model_path(&model_id)?
         .to_string_lossy()
         .to_string();
-    let active_context = active_engine_context(&engine, &requested_model_id)?;
+    let active_context = active_engine_context(engine, &requested_model_id)?;
     let process_label = engine_process_label(&active_context.backend);
 
     match probe_engine_health(
@@ -1612,12 +1612,14 @@ fn run_chat_completion_stream(
 
     let mut accumulator = StreamAccumulator::default();
     let stream_result = http_sse_request(
-        &active_context.host,
-        active_context.port,
-        "POST",
-        "/v1/chat/completions",
-        &payload,
-        HTTP_CHAT_TIMEOUT_MS,
+        SseHttpRequest {
+            host: &active_context.host,
+            port: active_context.port,
+            method: "POST",
+            path: "/v1/chat/completions",
+            body: &payload,
+            timeout_ms: HTTP_CHAT_TIMEOUT_MS,
+        },
         &cancel_token,
         |value| {
             let chunk = extract_stream_chunk(&value);
@@ -1687,9 +1689,8 @@ fn run_chat_completion_stream(
     }
 
     let elapsed_ms = started.elapsed().as_millis();
-    let completion_tokens = Some(accumulator.completion_tokens);
+    let completion_tokens = accumulator.completion_tokens;
     let tokens_per_second = tokens_per_second(accumulator.completion_tokens, elapsed_ms);
-    let total_tokens = completion_tokens;
 
     {
         let mut guard = engine
@@ -1697,9 +1698,7 @@ fn run_chat_completion_stream(
             .lock()
             .map_err(|_| "engine state lock is poisoned".to_string())?;
         guard.last_tokens_per_second = tokens_per_second;
-        guard.context_used_tokens = total_tokens
-            .unwrap_or_default()
-            .min(profile.runtime.context_length);
+        guard.context_used_tokens = completion_tokens.min(profile.runtime.context_length);
         guard.context_total_tokens = profile.runtime.context_length;
         guard.active_model_id = Some(active_context.active_model_id.clone());
         guard.active_model_name = Some(active_context.active_model_name.clone());
@@ -1730,8 +1729,8 @@ fn run_chat_completion_stream(
         elapsed_ms,
         tokens_per_second,
         prompt_tokens: None,
-        completion_tokens,
-        total_tokens,
+        completion_tokens: Some(completion_tokens),
+        total_tokens: Some(completion_tokens),
         finish_reason: accumulator.finish_reason,
     })
 }
@@ -2415,9 +2414,7 @@ fn unique_knowledge_base_id(store: &KnowledgeStore, name: &str) -> String {
 }
 
 fn sort_knowledge_bases(store: &mut KnowledgeStore) {
-    store
-        .bases
-        .sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    store.bases.sort_by_key(|base| base.name.to_lowercase());
 }
 
 fn documents_for_base(store: &KnowledgeStore, knowledge_base_id: &str) -> Vec<KnowledgeDocument> {
@@ -2427,7 +2424,7 @@ fn documents_for_base(store: &KnowledgeStore, knowledge_base_id: &str) -> Vec<Kn
         .filter(|document| document.knowledge_base_id == knowledge_base_id)
         .cloned()
         .collect::<Vec<_>>();
-    documents.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    documents.sort_by_key(|document| document.name.to_lowercase());
     documents
 }
 
@@ -3692,25 +3689,31 @@ fn tokens_per_second(tokens: u32, elapsed_ms: u128) -> f32 {
     (tokens as f64 / elapsed_ms as f64 * 1000.0) as f32
 }
 
-fn http_sse_request<F>(
-    host: &str,
+struct SseHttpRequest<'a> {
+    host: &'a str,
     port: u16,
-    method: &str,
-    path: &str,
-    body: &Value,
+    method: &'a str,
+    path: &'a str,
+    body: &'a Value,
     timeout_ms: u64,
+}
+
+fn http_sse_request<F>(
+    request: SseHttpRequest<'_>,
     cancel_token: &AtomicBool,
     mut on_value: F,
 ) -> Result<(), String>
 where
     F: FnMut(Value) -> Result<bool, String>,
 {
-    let body_bytes =
-        serde_json::to_vec(body).map_err(|err| format!("failed to encode request JSON: {err}"))?;
+    let body_bytes = serde_json::to_vec(request.body)
+        .map_err(|err| format!("failed to encode request JSON: {err}"))?;
+    let host = request.host;
+    let port = request.port;
     let address = format!("{host}:{port}")
         .parse::<SocketAddr>()
         .map_err(|err| format!("invalid local engine address {host}:{port}: {err}"))?;
-    let timeout = std::time::Duration::from_millis(timeout_ms);
+    let timeout = std::time::Duration::from_millis(request.timeout_ms);
     let mut stream = TcpStream::connect_timeout(&address, timeout)
         .map_err(|err| format!("failed to connect to local engine at {host}:{port}: {err}"))?;
     stream
@@ -3720,11 +3723,13 @@ where
         .set_write_timeout(Some(timeout))
         .map_err(|err| format!("failed to set write timeout: {err}"))?;
 
-    let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: Kivarro/0.1\r\nAccept: text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+    let request_head = format!(
+        "{} {} HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: Kivarro/0.1\r\nAccept: text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        request.method,
+        request.path,
         body_bytes.len()
     );
-    std::io::Write::write_all(&mut stream, request.as_bytes())
+    std::io::Write::write_all(&mut stream, request_head.as_bytes())
         .map_err(|err| format!("failed to write HTTP request: {err}"))?;
     std::io::Write::write_all(&mut stream, &body_bytes)
         .map_err(|err| format!("failed to write HTTP request body: {err}"))?;
@@ -4433,8 +4438,8 @@ fn gguf_fixed_value_size(value_type: u32) -> Option<u64> {
     match value_type {
         0 | 1 | 7 => Some(1),
         2 | 3 => Some(2),
-        4 | 5 | 6 => Some(4),
-        10 | 11 | 12 => Some(8),
+        4..=6 => Some(4),
+        10..=12 => Some(8),
         _ => None,
     }
 }
@@ -5053,13 +5058,16 @@ mod tests {
         });
 
         let started = Instant::now();
+        let request_body = json!({ "stream": true });
         let result = http_sse_request(
-            "127.0.0.1",
-            port,
-            "POST",
-            "/v1/chat/completions",
-            &json!({ "stream": true }),
-            10_000,
+            SseHttpRequest {
+                host: "127.0.0.1",
+                port,
+                method: "POST",
+                path: "/v1/chat/completions",
+                body: &request_body,
+                timeout_ms: 10_000,
+            },
             &cancel_token,
             |_| Ok(true),
         );

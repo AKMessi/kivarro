@@ -6,6 +6,8 @@
 
 - [ ] `npm run check`
 - [ ] `npm run build`
+- [ ] `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check`
+- [ ] `cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings`
 - [ ] `cargo check --manifest-path src-tauri/Cargo.toml`
 - [ ] `cargo test --manifest-path src-tauri/Cargo.toml`
 
