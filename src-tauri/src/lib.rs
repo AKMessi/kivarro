@@ -498,6 +498,12 @@ impl Default for ManagedEngine {
     }
 }
 
+impl Drop for ManagedEngine {
+    fn drop(&mut self) {
+        let _ = stop_child(self);
+    }
+}
+
 #[tauri::command]
 fn get_hardware_snapshot() -> Result<HardwareSnapshot, String> {
     let mut system = System::new_all();
@@ -5041,6 +5047,23 @@ mod tests {
     }
 
     #[test]
+    fn dropping_managed_engine_stops_child_process() {
+        let child = spawn_test_sleep_process();
+        let pid = child.id();
+
+        {
+            let mut guard = ManagedEngine::default();
+            guard.active_backend = "test-backend".to_string();
+            guard.child = Some(child);
+        }
+
+        if test_process_is_running(pid) {
+            terminate_test_process(pid);
+            panic!("managed engine drop left child process {pid} running");
+        }
+    }
+
+    #[test]
     fn creates_unique_model_destination_names() {
         let directory = env::temp_dir().join(format!(
             "kivarro-model-destination-{}-{}",
@@ -5238,6 +5261,70 @@ mod tests {
             .position(|arg| arg == key)
             .unwrap_or_else(|| panic!("{key} missing from args: {args:?}"));
         assert_eq!(args.get(position + 1).map(String::as_str), Some(value));
+    }
+
+    #[cfg(target_os = "windows")]
+    fn spawn_test_sleep_process() -> Child {
+        use std::os::windows::process::CommandExt;
+
+        let mut command = ProcessCommand::new("powershell.exe");
+        command
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                "Start-Sleep -Seconds 60",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(WINDOWS_CREATE_NO_WINDOW);
+        command.spawn().expect("spawn Windows sleep process")
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn spawn_test_sleep_process() -> Child {
+        ProcessCommand::new("sleep")
+            .arg("60")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn Unix sleep process")
+    }
+
+    #[cfg(target_os = "windows")]
+    fn test_process_is_running(pid: u32) -> bool {
+        let output = ProcessCommand::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .output()
+            .expect("query Windows process list");
+        String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn test_process_is_running(pid: u32) -> bool {
+        ProcessCommand::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    #[cfg(target_os = "windows")]
+    fn terminate_test_process(pid: u32) {
+        let _ = ProcessCommand::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/F", "/T"])
+            .status();
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn terminate_test_process(pid: u32) {
+        let _ = ProcessCommand::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
     }
 }
 
