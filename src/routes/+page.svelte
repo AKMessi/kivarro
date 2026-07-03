@@ -334,6 +334,10 @@
     commandPaletteOpen = false;
   }
 
+  function jumpToWorkspaceSection(sectionId: string) {
+    document.getElementById(sectionId)?.scrollIntoView({ block: "start" });
+  }
+
   function selectProfile(profileId: string) {
     const profile = profiles.find((candidate) => candidate.id === profileId);
     if (!profile) return;
@@ -1080,6 +1084,40 @@
             <code>{base.chunkCount}</code>
           </button>
         {/each}
+      {:else if activeView === "tuning"}
+        <div class="section-label">Saved profiles</div>
+        <div class="profile-context-list">
+          {#each profiles as profile}
+            <button class:active={selectedProfileId === profile.id} class="profile-context-card" onclick={() => selectProfile(profile.id)}>
+              <span>{profile.name}</span>
+              <small>{profile.description}</small>
+              <code>{profile.id}</code>
+            </button>
+          {/each}
+        </div>
+        <div class="section-label">Control groups</div>
+        <div class="jump-list">
+          <button onclick={() => jumpToWorkspaceSection("tuning-sampling")}>Sampling</button>
+          <button onclick={() => jumpToWorkspaceSection("tuning-penalties")}>Penalties</button>
+          <button onclick={() => jumpToWorkspaceSection("tuning-runtime")}>Runtime</button>
+          <button onclick={() => jumpToWorkspaceSection("tuning-json")}>Live JSON</button>
+        </div>
+      {:else if activeView === "settings"}
+        <div class="section-label">Settings categories</div>
+        <div class="jump-list">
+          <button onclick={() => jumpToWorkspaceSection("settings-general")}>General</button>
+          <button onclick={() => jumpToWorkspaceSection("settings-appearance")}>Appearance</button>
+          <button onclick={() => jumpToWorkspaceSection("settings-storage")}>Storage Paths</button>
+          <button onclick={() => jumpToWorkspaceSection("settings-advanced")}>Advanced</button>
+        </div>
+        <div class="context-stat">
+          <span>Theme</span>
+          <code>{theme}</code>
+        </div>
+        <div class="context-stat">
+          <span>API base</span>
+          <code>{configuredBaseUrl}</code>
+        </div>
       {:else if activeView === "logs"}
         <div class="filter-row">
           {#each ["ALL", "INFO", "WARN", "ERROR", "DEBUG"] as level}
@@ -1448,18 +1486,15 @@
           <p>{activeProfile.description}</p>
         </section>
 
-        <section class="tuning-grid">
+        <section class="tuning-grid" id="tuning-sampling">
           <div class="control-matrix">
+            <div class="panel-header inline"><span>Sampling</span><code>probability</code></div>
             {#each [
               ["Temperature", "temperature", 0, 2, 0.01],
               ["Top P", "topP", 0, 1, 0.01],
               ["Top K", "topK", 0, 200, 1],
               ["Min P", "minP", 0, 1, 0.01],
               ["Typical P", "typicalP", 0, 1, 0.01],
-              ["Repeat Penalty", "repeatPenalty", 0.8, 2, 0.01],
-              ["Repeat Last N", "repeatLastN", -1, 4096, 1],
-              ["Presence Penalty", "presencePenalty", -2, 2, 0.01],
-              ["Frequency Penalty", "frequencyPenalty", -2, 2, 0.01],
             ] as control}
               <label class="tuning-control">
                 <span>{control[0]}</span>
@@ -1475,10 +1510,30 @@
             {/each}
           </div>
 
-          <div class="distribution-panel">
+          <div class="distribution-panel" id="tuning-penalties">
             <div class="panel-header inline">
-              <span>Token probability distribution</span>
-              <code>live preview</code>
+              <span>Penalties</span>
+              <code>repetition control</code>
+            </div>
+            <div class="control-matrix compact">
+              {#each [
+                ["Repeat Penalty", "repeatPenalty", 0.8, 2, 0.01],
+                ["Repeat Last N", "repeatLastN", -1, 4096, 1],
+                ["Presence Penalty", "presencePenalty", -2, 2, 0.01],
+                ["Frequency Penalty", "frequencyPenalty", -2, 2, 0.01],
+              ] as control}
+                <label class="tuning-control">
+                  <span>{control[0]}</span>
+                  <input
+                    type="range"
+                    min={control[2]}
+                    max={control[3]}
+                    step={control[4]}
+                    bind:value={sampling[control[1] as keyof typeof sampling]}
+                  />
+                  <input class="number-input" type="number" step={control[4]} bind:value={sampling[control[1] as keyof typeof sampling]} />
+                </label>
+              {/each}
             </div>
             <div class="distribution-chart">
               {#each [88, 64, 42, 31, 24, 18, 13, 9, 7, 4] as value, index}
@@ -1488,58 +1543,61 @@
           </div>
         </section>
 
-        <section class="runtime-grid">
-          <label>
-            <span>Backend</span>
-            <select bind:value={sampling.backend}>
-              <option value="llama.cpp">llama.cpp</option>
-              <option value="mistral.rs">mistral.rs</option>
-            </select>
-          </label>
-          <label>
-            <span>KV cache</span>
-            <select bind:value={sampling.kvCacheQuantization} onchange={() => void updateLoadPlan()}>
-              <option value="f16">f16</option>
-              <option value="q8_0">q8_0</option>
-              <option value="q4_0">q4_0</option>
-              <option value="f32">f32</option>
-            </select>
-          </label>
-          <label>
-            <span>Batch</span>
-            <input type="number" min="1" step="1" bind:value={sampling.batchSize} />
-          </label>
-          <label>
-            <span>Micro batch</span>
-            <input type="number" min="1" step="1" bind:value={sampling.microBatchSize} />
-          </label>
-          <label>
-            <span>CPU threads</span>
-            <input type="number" min="1" step="1" bind:value={sampling.cpuThreads} />
-          </label>
-          <label>
-            <span>Mirostat</span>
-            <select bind:value={sampling.mirostatMode}>
-              <option value={0}>Off</option>
-              <option value={1}>v1</option>
-              <option value={2}>v2</option>
-            </select>
-          </label>
-          <label class="toggle-line">
-            <span>mmap</span>
-            <input type="checkbox" bind:checked={sampling.useMmap} />
-          </label>
-          <label class="toggle-line">
-            <span>mlock</span>
-            <input type="checkbox" bind:checked={sampling.useMlock} />
-          </label>
-          <label class="toggle-line">
-            <span>Flash Attention</span>
-            <input type="checkbox" bind:checked={sampling.flashAttention} />
-          </label>
+        <section class="runtime-panel" id="tuning-runtime">
+          <div class="panel-header inline"><span>Runtime</span><code>allocation</code></div>
+          <div class="runtime-grid">
+            <label>
+              <span>Backend</span>
+              <select bind:value={sampling.backend}>
+                <option value="llama.cpp">llama.cpp</option>
+                <option value="mistral.rs">mistral.rs</option>
+              </select>
+            </label>
+            <label>
+              <span>KV cache</span>
+              <select bind:value={sampling.kvCacheQuantization} onchange={() => void updateLoadPlan()}>
+                <option value="f16">f16</option>
+                <option value="q8_0">q8_0</option>
+                <option value="q4_0">q4_0</option>
+                <option value="f32">f32</option>
+              </select>
+            </label>
+            <label>
+              <span>Batch</span>
+              <input type="number" min="1" step="1" bind:value={sampling.batchSize} />
+            </label>
+            <label>
+              <span>Micro batch</span>
+              <input type="number" min="1" step="1" bind:value={sampling.microBatchSize} />
+            </label>
+            <label>
+              <span>CPU threads</span>
+              <input type="number" min="1" step="1" bind:value={sampling.cpuThreads} />
+            </label>
+            <label>
+              <span>Mirostat</span>
+              <select bind:value={sampling.mirostatMode}>
+                <option value={0}>Off</option>
+                <option value={1}>v1</option>
+                <option value={2}>v2</option>
+              </select>
+            </label>
+            <label class="toggle-line">
+              <span>mmap</span>
+              <input type="checkbox" bind:checked={sampling.useMmap} />
+            </label>
+            <label class="toggle-line">
+              <span>mlock</span>
+              <input type="checkbox" bind:checked={sampling.useMlock} />
+            </label>
+            <label class="toggle-line">
+              <span>Flash Attention</span>
+              <input type="checkbox" bind:checked={sampling.flashAttention} />
+            </label>
+          </div>
         </section>
 
-        <section class="schema-editor">
+        <section class="schema-editor" id="tuning-json">
           <div>
             <div class="panel-header inline"><span>Live profile JSON</span><code>{activeProfile.id}</code></div>
             <pre>{profilePreviewJson}</pre>
@@ -1834,7 +1892,7 @@
           </div>
         </section>
         <section class="settings-workspace">
-          <article>
+          <article id="settings-general">
             <div class="panel-header inline"><span>General</span><code>runtime</code></div>
             <label>
               <span>Default profile</span>
@@ -1852,7 +1910,7 @@
               </select>
             </label>
           </article>
-          <article>
+          <article id="settings-appearance">
             <div class="panel-header inline"><span>Appearance</span><code>{theme}</code></div>
             <label class="toggle-line">
               <span>Light mode</span>
@@ -1867,7 +1925,7 @@
               <input type="checkbox" bind:checked={leftCollapsed} />
             </label>
           </article>
-          <article>
+          <article id="settings-storage">
             <div class="panel-header inline"><span>Storage Paths</span><code>local</code></div>
             <div class="path-row">
               <span>Model library</span>
@@ -1882,7 +1940,7 @@
               <code>app-config/knowledge-store.json</code>
             </div>
           </article>
-          <article>
+          <article id="settings-advanced">
             <div class="panel-header inline"><span>Advanced</span><code>api</code></div>
             <label>
               <span>API host</span>
@@ -2273,6 +2331,8 @@
   .search-box,
   .model-import-box,
   .metric-stack,
+  .profile-context-list,
+  .jump-list,
   .inspector-section {
     display: grid;
     gap: 8px;
@@ -2337,7 +2397,9 @@
   }
 
   .history-item,
-  .model-mini {
+  .model-mini,
+  .profile-context-card,
+  .jump-list button {
     width: 100%;
     border: 1px solid transparent;
     border-radius: 7px;
@@ -2361,12 +2423,15 @@
   }
 
   .history-item:hover,
-  .model-mini:hover {
+  .model-mini:hover,
+  .profile-context-card:hover,
+  .jump-list button:hover {
     color: var(--text);
     background: var(--panel-2);
   }
 
-  .history-item.active {
+  .history-item.active,
+  .profile-context-card.active {
     color: var(--text);
     border-color: color-mix(in srgb, var(--cyan) 36%, var(--border));
     background: color-mix(in srgb, var(--cyan) 9%, var(--panel-2));
@@ -2410,6 +2475,67 @@
     display: grid;
     gap: 4px;
     padding: 8px;
+  }
+
+  .profile-context-card {
+    display: grid;
+    gap: 5px;
+    padding: 9px;
+  }
+
+  .profile-context-card span {
+    overflow: hidden;
+    color: var(--text);
+    font-size: 12px;
+    font-weight: 800;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .profile-context-card small {
+    display: -webkit-box;
+    overflow: hidden;
+    color: var(--dim);
+    font-size: 11px;
+    line-height: 1.35;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+  }
+
+  .profile-context-card code,
+  .context-stat code {
+    overflow: hidden;
+    color: var(--cyan);
+    font-size: 11px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .jump-list button {
+    min-height: 30px;
+    padding: 0 9px;
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    text-align: left;
+    text-transform: uppercase;
+  }
+
+  .context-stat {
+    display: grid;
+    gap: 5px;
+    padding: 9px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: var(--panel-2);
+  }
+
+  .context-stat span {
+    color: var(--dim);
+    font-size: 11px;
+    font-weight: 800;
+    text-transform: uppercase;
   }
 
   .model-mini.active,
@@ -2561,7 +2687,7 @@
   .control-band,
   .hardware-plan,
   .profile-strip,
-  .runtime-grid,
+  .runtime-panel,
   .distribution-panel,
   .schema-editor > div,
   .rag-grid article,
@@ -2879,7 +3005,7 @@
   .load-plan,
   .hardware-plan,
   .profile-strip,
-  .runtime-grid {
+  .runtime-panel {
     padding: 14px;
   }
 
@@ -2957,6 +3083,7 @@
     display: grid;
     grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 10px;
+    margin-top: 12px;
   }
 
   .runtime-grid label {
@@ -3003,6 +3130,10 @@
     gap: 10px;
   }
 
+  .control-matrix.compact {
+    gap: 8px;
+  }
+
   .tuning-control {
     grid-template-columns: 130px minmax(0, 1fr) 88px;
     align-items: center;
@@ -3017,11 +3148,14 @@
   }
 
   .distribution-panel {
+    display: grid;
+    align-content: start;
+    gap: 12px;
     padding: 14px;
   }
 
   .distribution-chart {
-    height: 220px;
+    height: 148px;
     display: flex;
     align-items: end;
     gap: 8px;
