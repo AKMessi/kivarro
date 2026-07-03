@@ -27,3 +27,7 @@ Do not include:
 ## Security Boundaries
 
 Kivarro is intended to run local inference tooling selected by the user. External binaries such as `llama-server` and `mistralrs` are outside this repository's trust boundary. Only run backends you trust.
+
+## Desktop WebView Hardening
+
+Kivarro ships with a restrictive Tauri Content Security Policy for packaged builds and a separate development policy for Vite hot reload. Do not disable CSP or prototype freezing to work around a UI bug; narrow the required directive and document the reason in the pull request.
