@@ -2233,25 +2233,61 @@
             <p class="eyebrow">System Logs</p>
             <h1>Runtime event stream</h1>
           </div>
-          <div class="log-toolbar">
-            <div class="filter-row inline-filter">
-              {#each ["ALL", "INFO", "WARN", "ERROR", "DEBUG"] as level}
-                <button class:active={logFilter === level} onclick={() => (logFilter = level)}>{level}</button>
-              {/each}
-            </div>
-            <input aria-label="Search logs" placeholder="Regex search..." bind:value={logSearch} />
+          <div class="log-summary">
+            <code>{formatTokens(filteredLogs.length)} visible</code>
+            <code>{formatTokens(logs.length)} total</code>
           </div>
         </section>
 
-        <section class="log-console">
-          {#each filteredLogs as entry}
-            <div class:warn={entry.level === "WARN"} class:error={entry.level === "ERROR"} class="log-line">
-              <code>{entry.timestamp}</code>
-              <strong>{entry.level}</strong>
-              <span>{entry.source}</span>
-              <p>{entry.message}</p>
+        <section class="log-workbench">
+          <aside class="log-level-rail" aria-label="Log level filters">
+            {#each ["ALL", "INFO", "WARN", "ERROR", "DEBUG"] as level}
+              <button class:active={logFilter === level} onclick={() => (logFilter = level)}>
+                <span>{level}</span>
+                <code>
+                  {level === "ALL"
+                    ? logs.length
+                    : logs.filter((entry) => entry.level.toUpperCase() === level).length}
+                </code>
+              </button>
+            {/each}
+          </aside>
+
+          <section class="log-terminal">
+            <div class="log-terminal-head">
+              <span>time</span>
+              <span>level</span>
+              <span>source</span>
+              <span>message</span>
             </div>
-          {/each}
+            <div class="log-console">
+              {#if filteredLogs.length === 0}
+                <div class="log-empty">
+                  <Terminal size={24} />
+                  <span>No log lines match the current filter.</span>
+                </div>
+              {:else}
+                {#each filteredLogs as entry}
+                  <div
+                    class:warn={entry.level === "WARN"}
+                    class:error={entry.level === "ERROR"}
+                    class:debug={entry.level === "DEBUG"}
+                    class="log-line"
+                  >
+                    <code>{entry.timestamp}</code>
+                    <strong>{entry.level}</strong>
+                    <span>{entry.source}</span>
+                    <p>{entry.message}</p>
+                  </div>
+                {/each}
+              {/if}
+            </div>
+            <div class="log-command-bar">
+              <code>grep</code>
+              <input aria-label="Search logs" placeholder='grep "model_load"' bind:value={logSearch} />
+              <button class="tool-button" disabled={!logSearch} onclick={() => (logSearch = "")}>Clear</button>
+            </div>
+          </section>
         </section>
       {:else}
         <section class="workspace-header">
@@ -4672,30 +4708,6 @@
     background: var(--bg-elevated);
   }
 
-  .log-toolbar {
-    width: min(640px, 52vw);
-    display: grid;
-    grid-template-columns: auto minmax(180px, 1fr);
-    align-items: center;
-    gap: 8px;
-  }
-
-  .inline-filter {
-    margin: 0;
-    display: flex;
-    gap: 4px;
-  }
-
-  .inline-filter button {
-    height: 28px;
-    padding: 0 9px;
-    border-radius: var(--radius-sm);
-  }
-
-  .log-toolbar input {
-    height: 28px;
-  }
-
   .api-dashboard {
     width: min(800px, calc(100% - 28px));
     justify-self: center;
@@ -4851,7 +4863,6 @@
       grid-template-columns: 1fr;
     }
 
-    .log-toolbar,
     .benchmark-metrics,
     .settings-workspace {
       grid-template-columns: 1fr;
@@ -5281,6 +5292,191 @@
     font-size: var(--text-xs);
   }
 
+  .shell.wide-workspace .workspace {
+    overflow: hidden;
+  }
+
+  .log-summary {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: var(--text-tertiary);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+  }
+
+  .log-summary code {
+    padding: 2px 6px;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated);
+  }
+
+  .log-workbench {
+    min-height: 0;
+    flex: 1 1 auto;
+    display: grid;
+    grid-template-columns: 112px minmax(0, 1fr);
+    margin: 0;
+    border-top: 1px solid var(--border-default);
+    background: var(--bg-app);
+  }
+
+  .log-level-rail {
+    min-height: 0;
+    display: grid;
+    align-content: start;
+    gap: 4px;
+    padding: 10px;
+    border-right: 1px solid var(--border-default);
+    background: var(--bg-panel);
+  }
+
+  .log-level-rail button {
+    min-height: 34px;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 8px;
+    padding: 0 8px;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm);
+    color: var(--text-tertiary);
+    background: transparent;
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .log-level-rail button:hover,
+  .log-level-rail button.active {
+    border-color: var(--border-strong);
+    color: var(--text-primary);
+    background: var(--bg-elevated);
+  }
+
+  .log-level-rail button.active {
+    border-left-color: var(--accent-primary);
+    color: var(--accent-primary);
+  }
+
+  .log-level-rail code {
+    color: var(--text-tertiary);
+    font-size: 10px;
+  }
+
+  .log-terminal {
+    min-width: 0;
+    min-height: 0;
+    display: grid;
+    grid-template-rows: 28px minmax(0, 1fr) 40px;
+    background: var(--bg-app);
+  }
+
+  .log-terminal-head,
+  .log-line {
+    display: grid;
+    grid-template-columns: 162px 64px 150px minmax(0, 1fr);
+    gap: 10px;
+    align-items: start;
+  }
+
+  .log-terminal-head {
+    align-items: center;
+    padding: 0 12px;
+    border-bottom: 1px solid var(--border-default);
+    color: var(--text-tertiary);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    background: var(--bg-panel);
+  }
+
+  .log-console {
+    min-height: 0;
+    overflow: auto;
+    padding: 0;
+    border: 0;
+    background: var(--bg-app);
+    font-size: 13px;
+    line-height: 1.45;
+  }
+
+  .log-line {
+    min-height: 28px;
+    padding: 5px 12px;
+    border-bottom: 1px solid color-mix(in srgb, var(--border-default) 72%, transparent);
+    color: var(--text-secondary);
+    font-family: var(--font-mono);
+  }
+
+  .log-line:hover {
+    background: color-mix(in srgb, var(--bg-elevated) 58%, transparent);
+  }
+
+  .log-line code,
+  .log-line span,
+  .log-line strong {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .log-line strong {
+    color: var(--text-secondary);
+    font-size: var(--text-xs);
+    font-weight: 700;
+  }
+
+  .log-line.warn strong {
+    color: var(--accent-warning);
+  }
+
+  .log-line.error strong {
+    color: var(--accent-danger);
+  }
+
+  .log-line.debug strong {
+    color: var(--text-tertiary);
+  }
+
+  .log-line p {
+    overflow-wrap: anywhere;
+  }
+
+  .log-empty {
+    min-height: 100%;
+    display: grid;
+    place-items: center;
+    align-content: center;
+    gap: 10px;
+    color: var(--text-tertiary);
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+  }
+
+  .log-command-bar {
+    display: grid;
+    grid-template-columns: 56px minmax(0, 1fr) 76px;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 8px;
+    border-top: 1px solid var(--border-default);
+    background: var(--bg-panel);
+  }
+
+  .log-command-bar > code {
+    color: var(--accent-primary);
+    font-size: var(--text-xs);
+    text-align: center;
+  }
+
+  .log-command-bar input {
+    height: 30px;
+  }
+
   .document-tree-list {
     display: grid;
     gap: 4px;
@@ -5552,6 +5748,35 @@
     .settings-savebar {
       align-items: stretch;
       flex-direction: column;
+    }
+
+    .log-workbench {
+      grid-template-columns: 88px minmax(0, 1fr);
+    }
+
+    .log-level-rail {
+      padding: 8px 6px;
+    }
+
+    .log-level-rail button {
+      grid-template-columns: 1fr;
+      justify-items: start;
+      gap: 2px;
+      padding: 5px 6px;
+    }
+
+    .log-terminal-head,
+    .log-line {
+      grid-template-columns: 132px 54px minmax(0, 1fr);
+    }
+
+    .log-terminal-head span:nth-child(3),
+    .log-line > span {
+      display: none;
+    }
+
+    .log-command-bar {
+      grid-template-columns: 46px minmax(0, 1fr) 64px;
     }
   }
 </style>
