@@ -7,7 +7,7 @@ Kivarro is a Rust/Tauri local model inference workstation for Windows, macOS, an
 - Tauri v2 desktop app with SvelteKit and TypeScript.
 - Custom Kivarro application shell with nav rail, contextual panel, workspace, inspector, and status bar.
 - Implemented views for Command Center, Model Registry, Hardware Fit, Expert Tuning, RAG Knowledge Bases, Agents, Local API, Benchmarks, Logs, and Settings.
-- Rust commands for CPU/RAM telemetry, local model discovery under `./models`, GGUF metadata indexing, API endpoint metadata, logs, and persisted benchmark result surfaces.
+- Rust commands for CPU/RAM telemetry, local model discovery/import under `./models`, GGUF metadata indexing, API endpoint metadata, logs, and persisted benchmark result surfaces.
 - Cross-platform accelerator discovery with NVIDIA SMI live utilization/VRAM telemetry and OS fallbacks for Windows, macOS, and Linux GPU inventory.
 - Persistent `.kivarro.json` inference profiles stored in the app config directory.
 - Profile-backed tuning controls for sampling, runtime, KV cache precision, context length, batching, mmap/mlock, and Flash Attention.
@@ -45,7 +45,7 @@ npm run preview -- --host 127.0.0.1 --port 4173
 
 ## Model files
 
-Place local model files under `./models`. The scanner recognizes `.gguf`, `.safetensors`, `.bin`, and `.mlx` files. GGUF files are indexed directly from the file header and metadata block for architecture, quantization, tensor count, context length, and transformer block count without loading tensor payloads.
+Place local model files under `./models`, or paste a model file path into Model Registry to copy it into the local library. The scanner recognizes `.gguf`, `.safetensors`, `.bin`, and `.mlx` files. GGUF files are indexed directly from the file header and metadata block for architecture, quantization, tensor count, context length, and transformer block count without loading tensor payloads.
 
 ## Local engines
 

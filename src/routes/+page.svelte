@@ -49,6 +49,7 @@
     getHardwareSnapshot,
     getModelLoadPlan,
     getRuntimeMetrics,
+    importModelFile,
     importKnowledgeDocument,
     listBenchmarkResults,
     listInferenceProfiles,
@@ -146,6 +147,8 @@
   let generationCancelling = false;
   let currentStreamRequestId = "";
   let apiCopyStatus = "Copy";
+  let modelImportPath = "";
+  let modelImportBusy = false;
   let selectedKnowledgeBaseId = "";
   let knowledgeImportPath = "";
   let newKnowledgeBaseName = "";
@@ -336,6 +339,26 @@
   function selectModel(modelId: string) {
     selectedModelId = modelId;
     void updateLoadPlan();
+  }
+
+  async function importModelPath() {
+    const path = modelImportPath.trim();
+    if (!path || modelImportBusy) return;
+
+    modelImportBusy = true;
+    try {
+      const result = await importModelFile(path);
+      models = result.models.length > 0 ? result.models : [result.imported];
+      selectedModelId = result.imported.id;
+      modelImportPath = "";
+      modelFilter = "";
+      await updateLoadPlan();
+      addSystemMessage("Model Registry", `Imported ${result.imported.name}`);
+    } catch (error) {
+      addSystemMessage("Model Registry", errorMessage(error));
+    } finally {
+      modelImportBusy = false;
+    }
   }
 
   async function selectKnowledgeBase(knowledgeBaseId: string) {
@@ -922,10 +945,27 @@
           <Search size={14} />
           <input placeholder="Filter local models" bind:value={modelFilter} />
         </div>
-        <button class="drop-zone">
-          <Upload size={18} />
-          <span>Drop .gguf or browse</span>
-        </button>
+        <div class="model-import-box">
+          <label for="model-import-path">Import model file</label>
+          <div>
+            <input
+              id="model-import-path"
+              placeholder="Paste path to .gguf, .mlx, .bin, or .safetensors"
+              bind:value={modelImportPath}
+              onkeydown={(event) => {
+                if (event.key === "Enter") void importModelPath();
+              }}
+            />
+            <button
+              aria-label="Import model file"
+              disabled={modelImportBusy || !modelImportPath.trim()}
+              onclick={importModelPath}
+            >
+              <Upload size={15} />
+            </button>
+          </div>
+          <small>{modelImportBusy ? "Copying into ./models" : "Files are copied into the local model library."}</small>
+        </div>
         <div class="section-label">Discovered</div>
         {#if models.length === 0}
           <p class="muted-copy">No models found in ./models yet.</p>
@@ -2060,6 +2100,7 @@
 
   .profile-select,
   .search-box,
+  .model-import-box,
   .metric-stack,
   .inspector-section {
     display: grid;
@@ -2125,8 +2166,7 @@
   }
 
   .history-item,
-  .model-mini,
-  .drop-zone {
+  .model-mini {
     width: 100%;
     border: 1px solid transparent;
     border-radius: 7px;
@@ -2167,15 +2207,32 @@
     gap: 6px;
   }
 
-  .drop-zone {
+  .model-import-box {
+    display: grid;
+    gap: 6px;
+    margin-top: 12px;
+  }
+
+  .model-import-box > div {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 34px;
+    gap: 6px;
+  }
+
+  .model-import-box button {
     display: grid;
     place-items: center;
-    gap: 8px;
-    min-height: 92px;
-    margin-top: 12px;
-    border-color: var(--border);
-    border-style: dashed;
-    color: var(--muted);
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    color: var(--text);
+    background: var(--panel-2);
+    cursor: pointer;
+  }
+
+  .model-import-box small {
+    color: var(--dim);
+    font-size: 11px;
+    line-height: 1.35;
   }
 
   .model-mini {

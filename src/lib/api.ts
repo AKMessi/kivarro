@@ -12,6 +12,7 @@ import type {
   KnowledgeBaseDetail,
   KnowledgeDocument,
   LogEntry,
+  ModelImportResult,
   ModelRecord,
   ModelLoadPlan,
   RetrievalMatch,
@@ -346,6 +347,28 @@ export function getRuntimeMetrics(): Promise<RuntimeMetrics> {
 
 export function listModels(): Promise<ModelRecord[]> {
   return safeInvoke("list_models", []);
+}
+
+export function importModelFile(path: string): Promise<ModelImportResult> {
+  const previewModel: ModelRecord = {
+    id: path,
+    name: path.split(/[\\/]/).pop() ?? "preview-model",
+    path,
+    format: "MODEL",
+    sizeGib: 0,
+    status: "Preview",
+    fit: "Unknown",
+    architecture: null,
+    parameterSize: null,
+    quantization: null,
+    contextLength: null,
+    blockCount: null,
+    tensorCount: null,
+    ggufVersion: null,
+    metadataSource: "Preview",
+  };
+
+  return invokeOrPreview("import_model_file", { imported: previewModel, models: [previewModel] }, { path });
 }
 
 export function listInferenceProfiles(): Promise<InferenceProfile[]> {

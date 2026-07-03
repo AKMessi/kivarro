@@ -126,6 +126,13 @@ struct ModelRecord {
     metadata_source: String,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelImportResult {
+    imported: ModelRecord,
+    models: Vec<ModelRecord>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct SamplingParameters {
@@ -934,6 +941,56 @@ fn list_models() -> Result<Vec<ModelRecord>, String> {
 
     models.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
     Ok(models)
+}
+
+#[tauri::command]
+fn import_model_file(path: String) -> Result<ModelImportResult, String> {
+    let raw_path = path.trim();
+    if raw_path.is_empty() {
+        return Err("model file path is required".to_string());
+    }
+
+    let source = fs::canonicalize(raw_path)
+        .map_err(|err| format!("failed to resolve model file {raw_path}: {err}"))?;
+    if !source.is_file() {
+        return Err(format!("model path is not a file: {}", source.display()));
+    }
+    if !is_supported_model_file(&source) {
+        return Err("model file must be .gguf, .safetensors, .bin, or .mlx".to_string());
+    }
+
+    let destination_dir = model_library_directory()?;
+    fs::create_dir_all(&destination_dir).map_err(|err| {
+        format!(
+            "failed to create model library {}: {err}",
+            destination_dir.display()
+        )
+    })?;
+
+    let library_root =
+        fs::canonicalize(&destination_dir).unwrap_or_else(|_| destination_dir.clone());
+    let destination = if source.starts_with(&library_root) {
+        source.clone()
+    } else {
+        let file_name = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| "model file name is not valid UTF-8".to_string())?;
+        let destination = unique_model_destination(&destination_dir, file_name);
+        fs::copy(&source, &destination).map_err(|err| {
+            format!(
+                "failed to copy model {} to {}: {err}",
+                source.display(),
+                destination.display()
+            )
+        })?;
+        destination
+    };
+
+    let imported = model_record_from_path(&destination)?;
+    let models = list_models()?;
+
+    Ok(ModelImportResult { imported, models })
 }
 
 #[tauri::command]
@@ -4383,9 +4440,13 @@ fn estimate_kv_cache_gib(context_length: u32, estimated_layers: u16, quantizatio
 }
 
 fn model_search_paths() -> Result<Vec<PathBuf>, String> {
+    Ok(vec![model_library_directory()?])
+}
+
+fn model_library_directory() -> Result<PathBuf, String> {
     let current_dir =
         env::current_dir().map_err(|err| format!("failed to read current directory: {err}"))?;
-    Ok(vec![current_dir.join("models")])
+    Ok(current_dir.join("models"))
 }
 
 fn collect_models(directory: &Path, models: &mut Vec<ModelRecord>) -> Result<(), String> {
@@ -4413,73 +4474,104 @@ fn collect_models(directory: &Path, models: &mut Vec<ModelRecord>) -> Result<(),
             continue;
         }
 
-        let metadata = entry
-            .metadata()
-            .map_err(|err| format!("failed to read model metadata {}: {err}", path.display()))?;
-        let fallback_name = path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .unwrap_or("Unnamed model")
-            .to_string();
-        let gguf_metadata = read_model_gguf_metadata(&path);
-        let name = gguf_metadata
-            .as_ref()
-            .map(|summary| gguf_display_name(summary, &fallback_name))
-            .unwrap_or_else(|| fallback_name.clone());
-        let format = path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or("unknown")
-            .to_ascii_uppercase();
-        let size_gib = bytes_to_gib(metadata.len());
-        let architecture = gguf_metadata
-            .as_ref()
-            .and_then(|summary| summary.architecture.clone());
-        let parameter_size = gguf_metadata
-            .as_ref()
-            .and_then(|summary| summary.parameter_size.clone());
-        let quantization = gguf_metadata
-            .as_ref()
-            .and_then(|summary| summary.quantization.clone())
-            .or_else(|| infer_quantization_from_name(&fallback_name));
-        let context_length = gguf_metadata
-            .as_ref()
-            .and_then(|summary| summary.context_length);
-        let block_count = gguf_metadata
-            .as_ref()
-            .and_then(|summary| summary.block_count);
-        let tensor_count = gguf_metadata.as_ref().map(|summary| summary.tensor_count);
-        let gguf_version = gguf_metadata.as_ref().map(|summary| summary.version);
-        let metadata_source = gguf_metadata
-            .as_ref()
-            .map(|summary| format!("GGUF v{}", summary.version))
-            .unwrap_or_else(|| "filename".to_string());
-        let status = if gguf_metadata.is_some() {
-            "Indexed"
-        } else {
-            "Discovered"
-        };
-
-        models.push(ModelRecord {
-            id: path.to_string_lossy().to_string(),
-            name,
-            path: path.to_string_lossy().to_string(),
-            format,
-            size_gib,
-            status: status.to_string(),
-            fit: model_fit_label(size_gib),
-            architecture,
-            parameter_size,
-            quantization,
-            context_length,
-            block_count,
-            tensor_count,
-            gguf_version,
-            metadata_source,
-        });
+        models.push(model_record_from_path(&path)?);
     }
 
     Ok(())
+}
+
+fn model_record_from_path(path: &Path) -> Result<ModelRecord, String> {
+    let metadata = fs::metadata(path)
+        .map_err(|err| format!("failed to read model metadata {}: {err}", path.display()))?;
+    let fallback_name = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("Unnamed model")
+        .to_string();
+    let gguf_metadata = read_model_gguf_metadata(path);
+    let name = gguf_metadata
+        .as_ref()
+        .map(|summary| gguf_display_name(summary, &fallback_name))
+        .unwrap_or_else(|| fallback_name.clone());
+    let format = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("unknown")
+        .to_ascii_uppercase();
+    let size_gib = bytes_to_gib(metadata.len());
+    let architecture = gguf_metadata
+        .as_ref()
+        .and_then(|summary| summary.architecture.clone());
+    let parameter_size = gguf_metadata
+        .as_ref()
+        .and_then(|summary| summary.parameter_size.clone());
+    let quantization = gguf_metadata
+        .as_ref()
+        .and_then(|summary| summary.quantization.clone())
+        .or_else(|| infer_quantization_from_name(&fallback_name));
+    let context_length = gguf_metadata
+        .as_ref()
+        .and_then(|summary| summary.context_length);
+    let block_count = gguf_metadata
+        .as_ref()
+        .and_then(|summary| summary.block_count);
+    let tensor_count = gguf_metadata.as_ref().map(|summary| summary.tensor_count);
+    let gguf_version = gguf_metadata.as_ref().map(|summary| summary.version);
+    let metadata_source = gguf_metadata
+        .as_ref()
+        .map(|summary| format!("GGUF v{}", summary.version))
+        .unwrap_or_else(|| "filename".to_string());
+    let status = if gguf_metadata.is_some() {
+        "Indexed"
+    } else {
+        "Discovered"
+    };
+
+    Ok(ModelRecord {
+        id: path.to_string_lossy().to_string(),
+        name,
+        path: path.to_string_lossy().to_string(),
+        format,
+        size_gib,
+        status: status.to_string(),
+        fit: model_fit_label(size_gib),
+        architecture,
+        parameter_size,
+        quantization,
+        context_length,
+        block_count,
+        tensor_count,
+        gguf_version,
+        metadata_source,
+    })
+}
+
+fn unique_model_destination(directory: &Path, file_name: &str) -> PathBuf {
+    let candidate = directory.join(file_name);
+    if !candidate.exists() {
+        return candidate;
+    }
+
+    let path = Path::new(file_name);
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("model");
+    let extension = path.extension().and_then(|value| value.to_str());
+
+    for suffix in 2..=9999 {
+        let next_name = match extension {
+            Some(extension) if !extension.is_empty() => format!("{stem}-{suffix}.{extension}"),
+            _ => format!("{stem}-{suffix}"),
+        };
+        let next = directory.join(next_name);
+        if !next.exists() {
+            return next;
+        }
+    }
+
+    directory.join(format!("{stem}-{}", unix_timestamp()))
 }
 
 fn is_gguf_file(path: &Path) -> bool {
@@ -4672,6 +4764,27 @@ mod tests {
     }
 
     #[test]
+    fn creates_unique_model_destination_names() {
+        let directory = env::temp_dir().join(format!(
+            "kivarro-model-destination-{}-{}",
+            std::process::id(),
+            unix_timestamp()
+        ));
+        fs::create_dir_all(&directory).expect("create model destination test directory");
+        File::create(directory.join("sample.gguf")).expect("create first model");
+        File::create(directory.join("sample-2.gguf")).expect("create second model");
+
+        let destination = unique_model_destination(&directory, "sample.gguf");
+
+        assert_eq!(
+            destination.file_name().and_then(|name| name.to_str()),
+            Some("sample-3.gguf")
+        );
+
+        fs::remove_dir_all(directory).expect("remove model destination test directory");
+    }
+
+    #[test]
     fn parses_nvidia_smi_gpu_telemetry() {
         let blocks = parse_nvidia_smi_gpus("NVIDIA RTX 4090, 57, 24564, 12000\n");
 
@@ -4857,6 +4970,7 @@ pub fn run() {
             get_hardware_snapshot,
             get_runtime_metrics,
             list_models,
+            import_model_file,
             list_inference_profiles,
             save_inference_profile,
             delete_inference_profile,

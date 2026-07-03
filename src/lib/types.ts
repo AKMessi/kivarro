@@ -71,6 +71,11 @@ export interface ModelRecord {
   metadataSource: string;
 }
 
+export interface ModelImportResult {
+  imported: ModelRecord;
+  models: ModelRecord[];
+}
+
 export interface SamplingParameters {
   temperature: number;
   topP: number;
