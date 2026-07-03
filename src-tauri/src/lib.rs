@@ -5,7 +5,7 @@ use std::{
     env, fs,
     fs::File,
     io::{ErrorKind, Read, Seek, SeekFrom},
-    net::{SocketAddr, TcpStream},
+    net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::{Child, Command as ProcessCommand, Stdio},
     sync::{
@@ -2343,21 +2343,36 @@ fn write_api_settings(app_handle: &AppHandle, settings: &ApiSettings) -> Result<
 }
 
 fn normalize_api_settings(settings: ApiSettings) -> Result<ApiSettings, String> {
-    let host = settings.host.trim();
+    if settings.port == 0 {
+        return Err("API port must be between 1 and 65535".to_string());
+    }
+
+    Ok(ApiSettings {
+        host: normalize_api_host(&settings.host)?,
+        port: settings.port,
+    })
+}
+
+fn normalize_api_host(host: &str) -> Result<String, String> {
+    let host = host.trim();
     if host.is_empty() {
         return Err("API host is required".to_string());
     }
     if host.chars().any(char::is_whitespace) {
         return Err("API host cannot contain whitespace".to_string());
     }
-    if settings.port == 0 {
-        return Err("API port must be between 1 and 65535".to_string());
+    if host.eq_ignore_ascii_case("localhost") {
+        return Ok("localhost".to_string());
     }
 
-    Ok(ApiSettings {
-        host: host.to_string(),
-        port: settings.port,
-    })
+    let ip = host
+        .parse::<IpAddr>()
+        .map_err(|_| "API host must be localhost or a loopback IP address".to_string())?;
+    if !ip.is_loopback() {
+        return Err("API host must be localhost or a loopback IP address".to_string());
+    }
+
+    Ok(ip.to_string())
 }
 
 fn sync_engine_endpoint_if_idle(
@@ -2378,7 +2393,14 @@ fn sync_engine_endpoint_if_idle(
 }
 
 fn api_base_url(host: &str, port: u16) -> String {
-    format!("http://{host}:{port}/v1")
+    format!("http://{}:{port}/v1", format_http_host(host))
+}
+
+fn format_http_host(host: &str) -> String {
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V6(_)) => format!("[{host}]"),
+        _ => host.to_string(),
+    }
 }
 
 fn benchmark_results_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
@@ -3645,12 +3667,8 @@ fn http_json_request(
         .transpose()
         .map_err(|err| format!("failed to encode request JSON: {err}"))?
         .unwrap_or_default();
-    let address = format!("{host}:{port}")
-        .parse::<SocketAddr>()
-        .map_err(|err| format!("invalid local engine address {host}:{port}: {err}"))?;
     let timeout = std::time::Duration::from_millis(timeout_ms);
-    let mut stream = TcpStream::connect_timeout(&address, timeout)
-        .map_err(|err| format!("failed to connect to local engine at {host}:{port}: {err}"))?;
+    let mut stream = connect_to_engine(host, port, timeout)?;
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|err| format!("failed to set read timeout: {err}"))?;
@@ -3658,8 +3676,9 @@ fn http_json_request(
         .set_write_timeout(Some(timeout))
         .map_err(|err| format!("failed to set write timeout: {err}"))?;
 
+    let http_host = format_http_host(host);
     let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: Kivarro/0.1\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "{method} {path} HTTP/1.1\r\nHost: {http_host}:{port}\r\nUser-Agent: Kivarro/0.1\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body_bytes.len()
     );
     std::io::Write::write_all(&mut stream, request.as_bytes())
@@ -3683,6 +3702,53 @@ fn http_json_request(
     }
 
     parse_http_response(&raw)
+}
+
+fn connect_to_engine(host: &str, port: u16, timeout: Duration) -> Result<TcpStream, String> {
+    let addresses = resolve_engine_socket_addrs(host, port)?;
+    let mut errors = Vec::new();
+
+    for address in addresses {
+        match TcpStream::connect_timeout(&address, timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(err) => errors.push(format!("{address}: {err}")),
+        }
+    }
+
+    Err(format!(
+        "failed to connect to local engine at {}:{port}: {}",
+        format_http_host(host),
+        errors.join("; ")
+    ))
+}
+
+fn resolve_engine_socket_addrs(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if !ip.is_loopback() {
+            return Err("local engine host must be a loopback IP address".to_string());
+        }
+        return Ok(vec![SocketAddr::new(ip, port)]);
+    }
+
+    if !host.eq_ignore_ascii_case("localhost") {
+        return Err("local engine host must be localhost or a loopback IP address".to_string());
+    }
+
+    let mut addresses = (host, port)
+        .to_socket_addrs()
+        .map_err(|err| format!("failed to resolve local engine host {host}:{port}: {err}"))?
+        .filter(|address| address.ip().is_loopback())
+        .collect::<Vec<_>>();
+    addresses.sort_by_key(|address| if address.ip().is_ipv4() { 0 } else { 1 });
+    addresses.dedup();
+
+    if addresses.is_empty() {
+        return Err(format!(
+            "local engine host {host}:{port} did not resolve to a loopback address"
+        ));
+    }
+
+    Ok(addresses)
 }
 
 fn parse_http_response(raw: &[u8]) -> Result<HttpResponse, String> {
@@ -3814,12 +3880,8 @@ where
         .map_err(|err| format!("failed to encode request JSON: {err}"))?;
     let host = request.host;
     let port = request.port;
-    let address = format!("{host}:{port}")
-        .parse::<SocketAddr>()
-        .map_err(|err| format!("invalid local engine address {host}:{port}: {err}"))?;
     let timeout = std::time::Duration::from_millis(request.timeout_ms);
-    let mut stream = TcpStream::connect_timeout(&address, timeout)
-        .map_err(|err| format!("failed to connect to local engine at {host}:{port}: {err}"))?;
+    let mut stream = connect_to_engine(host, port, timeout)?;
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|err| format!("failed to set read timeout: {err}"))?;
@@ -3827,8 +3889,9 @@ where
         .set_write_timeout(Some(timeout))
         .map_err(|err| format!("failed to set write timeout: {err}"))?;
 
+    let http_host = format_http_host(host);
     let request_head = format!(
-        "{} {} HTTP/1.1\r\nHost: {host}:{port}\r\nUser-Agent: Kivarro/0.1\r\nAccept: text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "{} {} HTTP/1.1\r\nHost: {http_host}:{port}\r\nUser-Agent: Kivarro/0.1\r\nAccept: text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         request.method,
         request.path,
         body_bytes.len()
@@ -4985,7 +5048,7 @@ mod tests {
     #[test]
     fn normalizes_api_settings_and_base_url() {
         let settings = normalize_api_settings(ApiSettings {
-            host: "  localhost ".to_string(),
+            host: "  LOCALHOST ".to_string(),
             port: 9099,
         })
         .expect("valid API settings");
@@ -4996,6 +5059,14 @@ mod tests {
             api_base_url(&settings.host, settings.port),
             "http://localhost:9099/v1"
         );
+
+        let ipv6 = normalize_api_settings(ApiSettings {
+            host: "::1".to_string(),
+            port: 8081,
+        })
+        .expect("valid IPv6 loopback API settings");
+        assert_eq!(ipv6.host, "::1");
+        assert_eq!(api_base_url(&ipv6.host, ipv6.port), "http://[::1]:8081/v1");
     }
 
     #[test]
@@ -5010,6 +5081,29 @@ mod tests {
             port: 0,
         })
         .is_err());
+        assert!(normalize_api_settings(ApiSettings {
+            host: "0.0.0.0".to_string(),
+            port: 8080,
+        })
+        .is_err());
+        assert!(normalize_api_settings(ApiSettings {
+            host: "192.168.1.50".to_string(),
+            port: 8080,
+        })
+        .is_err());
+        assert!(normalize_api_settings(ApiSettings {
+            host: "example.com".to_string(),
+            port: 8080,
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn resolves_localhost_engine_addresses_to_loopback() {
+        let addresses = resolve_engine_socket_addrs("localhost", 8080).expect("resolve localhost");
+
+        assert!(!addresses.is_empty());
+        assert!(addresses.iter().all(|address| address.ip().is_loopback()));
     }
 
     #[test]

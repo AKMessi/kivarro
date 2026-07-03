@@ -26,7 +26,7 @@ Do not include:
 
 ## Security Boundaries
 
-Kivarro is intended to run local inference tooling selected by the user. External binaries such as `llama-server` and `mistralrs` are outside this repository's trust boundary. Only run backends you trust.
+Kivarro is intended to run local inference tooling selected by the user. External binaries such as `llama-server` and `mistralrs` are outside this repository's trust boundary. Only run backends you trust. The supervised Local API host is restricted to `localhost` or loopback IP addresses to avoid accidental LAN exposure.
 
 ## Desktop WebView Hardening
 

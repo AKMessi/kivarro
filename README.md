@@ -95,7 +95,7 @@ export KIVARRO_MISTRALRS=/path/to/mistralrs
 export KIVARRO_API_PORT=8080
 ```
 
-The Local API view persists the host and port to the app config directory. `KIVARRO_API_PORT` is used as the initial/default port when no saved setting exists. Stop the loaded model before changing the endpoint, then load the model again to start the backend on the new host/port.
+The Local API view persists the host and port to the app config directory. The host is intentionally limited to `localhost` or loopback IP addresses such as `127.0.0.1` and `::1`; Kivarro does not bind supervised model servers to LAN-facing addresses. `KIVARRO_API_PORT` is used as the initial/default port when no saved setting exists. Stop the loaded model before changing the endpoint, then load the model again to start the backend on the new host/port.
 
 The Load Model action starts the selected backend with the active `.kivarro.json` profile. `llama.cpp` launches `llama-server` with model path, context length, CPU threads, batch/micro-batch, GPU layers, tensor split, KV cache precision, mmap/mlock, Flash Attention, and RoPE overrides. `mistral.rs` launches `mistralrs serve -m <model> --host <configured-host> -p <configured-port> --no-ui` and uses the single-model OpenAI-compatible request id `default`.
 
