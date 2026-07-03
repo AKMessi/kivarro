@@ -4,13 +4,13 @@
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import {
     Activity,
-    Archive,
+    BookOpen,
+    Bot,
     Boxes,
     BrainCircuit,
     ChevronDown,
     Circle,
     Clipboard,
-    Command,
     Cpu,
     Database,
     FileText,
@@ -31,6 +31,7 @@
     Server,
     Settings,
     SlidersHorizontal,
+    ScrollText,
     Split,
     Sun,
     Terminal,
@@ -102,15 +103,15 @@
   };
 
   const navItems: NavItem[] = [
-    { id: "command", label: "Command Center", icon: Command },
-    { id: "models", label: "Model Registry", icon: Archive },
+    { id: "command", label: "Command Center", icon: Terminal },
+    { id: "models", label: "Model Registry", icon: Database },
     { id: "hardware", label: "Hardware Fit", icon: Cpu },
     { id: "tuning", label: "Expert Tuning", icon: SlidersHorizontal },
-    { id: "knowledge", label: "Knowledge Base", icon: Database },
-    { id: "agents", label: "Agents", icon: BrainCircuit },
-    { id: "api", label: "Local API", icon: Server },
+    { id: "knowledge", label: "Knowledge Base", icon: BookOpen },
+    { id: "agents", label: "Agents", icon: Bot },
+    { id: "api", label: "Local API", icon: Network },
     { id: "benchmarks", label: "Benchmarks", icon: Gauge },
-    { id: "logs", label: "System Logs", icon: Terminal },
+    { id: "logs", label: "System Logs", icon: ScrollText },
     { id: "settings", label: "Settings", icon: Settings },
   ];
 
@@ -431,6 +432,28 @@
     engineNotice = `Starting ${profile.runtime.backend} for ${selectedModel.name}`;
     try {
       engineStatus = await startInferenceEngine(selectedModelId, profile);
+      engineNotice = engineStatus.message;
+      const [nextMetrics, nextApiStatus] = await Promise.all([getRuntimeMetrics(), getApiStatus()]);
+      metrics = nextMetrics;
+      apiStatus = nextApiStatus;
+      await refreshLogs();
+    } catch (error) {
+      engineNotice = errorMessage(error);
+      addSystemMessage("Engine", engineNotice);
+    } finally {
+      engineBusy = false;
+    }
+  }
+
+  async function loadModelFromRegistry(model: ModelRecord) {
+    selectedModelId = model.id;
+    await updateLoadPlan();
+
+    const profile = buildProfileFromControls();
+    engineBusy = true;
+    engineNotice = `Starting ${profile.runtime.backend} for ${model.name}`;
+    try {
+      engineStatus = await startInferenceEngine(model.id, profile);
       engineNotice = engineStatus.message;
       const [nextMetrics, nextApiStatus] = await Promise.all([getRuntimeMetrics(), getApiStatus()]);
       metrics = nextMetrics;
@@ -880,6 +903,11 @@
       <span class="wordmark">Kivarro</span>
       <span class="title-divider"></span>
       <span class="active-view">{activeMeta.label}</span>
+      <button class="title-command" data-tauri-drag-region="false" onclick={() => (commandPaletteOpen = !commandPaletteOpen)}>
+        <Search size={13} />
+        <span>Command / action</span>
+        <code>Ctrl K</code>
+      </button>
     </div>
 
     <div class="quick-actions">
@@ -1074,7 +1102,13 @@
             </div>
             <div class="message-list">
               {#each chatMessages as message}
-                <article class:system={message.role === "system"} class:streaming={message.streaming} class="message">
+                <article
+                  class:user={message.role === "user"}
+                  class:assistant={message.role === "assistant"}
+                  class:system={message.role === "system"}
+                  class:streaming={message.streaming}
+                  class="message"
+                >
                   <div class="message-meta">
                     <span>{message.label}</span>
                     {#if message.tokens}
@@ -1131,6 +1165,18 @@
                 }
               }}
             ></textarea>
+            <div class="prompt-tools">
+              <select aria-label="Prompt profile" bind:value={selectedProfileId} onchange={(event) => selectProfile(event.currentTarget.value)}>
+                {#each profiles as profile}
+                  <option value={profile.id}>{profile.name}</option>
+                {/each}
+              </select>
+              <label>
+                <span>Temp</span>
+                <input type="range" min="0" max="1" step="0.01" bind:value={sampling.temperature} />
+                <code>{formatNumber(sampling.temperature, 2)}</code>
+              </label>
+            </div>
             <button
               class:stopping={promptBusy}
               class="send-button"
@@ -1175,31 +1221,49 @@
         {:else}
           <section class="model-table">
             <div class="table-row header">
-              <span>Name</span>
+              <span>Status</span>
+              <span>Model</span>
               <span>Arch</span>
               <span>Quant</span>
-              <span>Context</span>
-              <span>Layers</span>
               <span>Size</span>
-              <span>Fit</span>
+              <span>RAM Req</span>
+              <span>Actions</span>
             </div>
             {#each filteredModels as model}
-              <button
+              <div
                 class:active={selectedModelId === model.id}
                 class="table-row model-row"
+                role="button"
+                tabindex="0"
                 onclick={() => selectModel(model.id)}
+                onkeydown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    selectModel(model.id);
+                  }
+                }}
               >
+                <span class:online-dot={engineStatus?.activeModelId === model.id} class="model-status-dot"></span>
                 <span class="model-name-cell">
                   <strong>{model.name}</strong>
                   <small>{model.metadataSource}</small>
                 </span>
                 <code>{optionalText(model.architecture)}</code>
-                <code>{optionalText(model.quantization, model.format)}</code>
-                <code>{formatTokenLimit(model.contextLength)}</code>
-                <code>{formatLayerCount(model.blockCount)}</code>
+                <code class="quant-badge">{optionalText(model.quantization, model.format)}</code>
                 <code>{formatNumber(model.sizeGib)} GiB</code>
                 <span class:good={model.fit === "Fits"} class:warn={model.fit !== "Fits"}>{model.fit}</span>
-              </button>
+                <button
+                  class:danger={engineStatus?.activeModelId === model.id}
+                  class="row-action"
+                  disabled={engineBusy}
+                  onclick={(event) => {
+                    event.stopPropagation();
+                    void loadModelFromRegistry(model);
+                  }}
+                >
+                  {engineStatus?.activeModelId === model.id ? "Restart" : "Load"}
+                </button>
+              </div>
             {/each}
           </section>
         {/if}
@@ -3307,9 +3371,605 @@
     background: var(--panel-2);
   }
 
+  /* Engineering Cockpit revamp layer */
+  .app {
+    grid-template-rows: 40px minmax(0, 1fr) 24px;
+    background: var(--bg-app);
+    color: var(--text-primary);
+    font-size: var(--text-sm);
+  }
+
+  .titlebar {
+    grid-template-columns: 132px minmax(0, 1fr) 180px;
+    height: 40px;
+    border-bottom: 1px solid var(--border-default);
+    background: color-mix(in srgb, var(--bg-app) 96%, transparent);
+  }
+
+  .window-controls,
+  .quick-actions {
+    gap: 6px;
+    padding: 0 10px;
+  }
+
+  .window-control {
+    width: 12px;
+    height: 12px;
+  }
+
+  .title-identity {
+    justify-content: flex-start;
+    gap: 10px;
+    padding: 0 8px;
+    font-size: var(--text-xs);
+  }
+
+  .wordmark {
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 800;
+    letter-spacing: 0.2em;
+  }
+
+  .title-divider {
+    background: var(--border-strong);
+  }
+
+  .active-view {
+    flex: 0 0 auto;
+    color: var(--text-tertiary);
+    font-family: var(--font-mono);
+  }
+
+  .title-command {
+    width: min(420px, 38vw);
+    height: 26px;
+    display: grid;
+    grid-template-columns: 18px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 7px;
+    margin-left: 12px;
+    padding: 0 8px;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-sm);
+    color: var(--text-tertiary);
+    background: var(--bg-elevated);
+    cursor: pointer;
+  }
+
+  .title-command span {
+    overflow: hidden;
+    text-align: left;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .title-command code {
+    padding: 1px 5px;
+    border: 1px solid var(--border-default);
+    border-radius: 3px;
+    color: var(--text-secondary);
+    font-family: var(--font-mono);
+    font-size: 10px;
+  }
+
+  .icon-button {
+    width: 28px;
+    height: 26px;
+    border-radius: var(--radius-sm);
+    color: var(--text-tertiary);
+  }
+
+  .icon-button:hover {
+    color: var(--text-primary);
+    background: var(--bg-elevated);
+  }
+
+  .shell {
+    grid-template-columns: 48px 240px minmax(0, 1fr) 320px;
+    background: var(--bg-app);
+    transition: grid-template-columns 120ms ease;
+  }
+
+  .shell.left-collapsed {
+    grid-template-columns: 48px 0 minmax(0, 1fr) 320px;
+  }
+
+  .shell.right-collapsed {
+    grid-template-columns: 48px 240px minmax(0, 1fr) 0;
+  }
+
+  .shell.left-collapsed.right-collapsed {
+    grid-template-columns: 48px 0 minmax(0, 1fr) 0;
+  }
+
+  .nav-rail,
+  .context-panel,
+  .inspector {
+    border-color: var(--border-default);
+    background: var(--bg-panel);
+  }
+
+  .nav-rail {
+    padding: 6px 0;
+  }
+
+  .rail-stack {
+    gap: 3px;
+  }
+
+  .rail-button {
+    position: relative;
+    width: 40px;
+    height: 34px;
+    border-radius: var(--radius-sm);
+    color: var(--text-tertiary);
+  }
+
+  .rail-button::before {
+    content: "";
+    position: absolute;
+    inset: 7px auto 7px 0;
+    width: 2px;
+    border-radius: 2px;
+    background: transparent;
+  }
+
+  .rail-button:hover {
+    color: var(--text-primary);
+    background: var(--bg-elevated);
+  }
+
+  .rail-button.active {
+    color: var(--accent-primary);
+    background: var(--bg-active);
+  }
+
+  .rail-button.active::before {
+    background: var(--accent-primary);
+  }
+
+  .rail-button.monitor {
+    color: var(--accent-info);
+  }
+
+  .panel-header {
+    height: 36px;
+    padding: 0 10px;
+    border-color: var(--border-default);
+    color: var(--text-secondary);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  .context-panel > :not(.panel-header),
+  .inspector-section {
+    margin: 10px;
+  }
+
+  .workspace {
+    min-width: 0;
+    padding: 0;
+    background: var(--bg-panel);
+  }
+
+  .workspace-header {
+    min-height: 58px;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border-default);
+    background: var(--bg-panel);
+  }
+
+  .workspace-header h1 {
+    margin: 0;
+    color: var(--text-primary);
+    font-size: var(--text-xl);
+    font-weight: 650;
+    letter-spacing: 0;
+  }
+
+  .eyebrow,
+  .section-label {
+    color: var(--text-tertiary);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+
+  select,
+  input,
+  textarea {
+    height: 32px;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    background: var(--bg-elevated);
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+  }
+
+  textarea {
+    height: auto;
+    min-height: 64px;
+    line-height: 1.55;
+  }
+
+  .tool-button,
+  .primary-button,
+  .send-button,
+  .power-button,
+  .segmented button,
+  .inspector-action {
+    min-height: 32px;
+    border-radius: var(--radius-sm);
+    font-size: var(--text-sm);
+  }
+
+  .tool-button,
+  .segmented button,
+  .inspector-action.secondary {
+    border: 1px solid var(--border-default);
+    color: var(--text-primary);
+    background: var(--bg-elevated);
+  }
+
+  .tool-button:hover,
+  .segmented button:hover,
+  .inspector-action.secondary:hover {
+    border-color: var(--border-strong);
+    background: var(--bg-active);
+  }
+
+  .primary-button,
+  .send-button,
+  .inspector-action {
+    border: 0;
+    color: #020617;
+    background: var(--accent-primary);
+    font-weight: 700;
+  }
+
+  .power-button {
+    border: 1px solid var(--border-default);
+    color: var(--text-primary);
+    background: var(--bg-elevated);
+  }
+
+  .power-button.online,
+  .primary-button.online {
+    color: #020617;
+    background: var(--accent-primary);
+  }
+
+  .search-box,
+  .model-import-box > div,
+  .kb-create-row,
+  .api-url,
+  .retrieval-dock {
+    border-color: var(--border-default);
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated);
+  }
+
+  .history-item,
+  .model-mini,
+  .endpoint-row,
+  .document-list div,
+  .retrieval-results article,
+  .rag-metric-grid div,
+  .compute-block,
+  .agent-node,
+  .tool-permissions label,
+  .settings-grid article,
+  .load-plan,
+  .hardware-plan,
+  .profile-strip,
+  .distribution-panel,
+  .schema-editor > div,
+  .api-dashboard,
+  .benchmark-bars div {
+    border-color: var(--border-default);
+    border-radius: var(--radius-md);
+    background: var(--bg-panel);
+    box-shadow: none;
+  }
+
+  .history-item:hover,
+  .model-mini:hover,
+  .model-row:hover {
+    color: var(--text-primary);
+    background: var(--bg-elevated);
+  }
+
+  .history-item.active,
+  .model-mini.active,
+  .model-row.active {
+    border-color: var(--border-strong);
+    background: var(--bg-active);
+  }
+
+  .model-table {
+    display: grid;
+    gap: 0;
+    padding: 0;
+    border-top: 1px solid var(--border-default);
+    border-bottom: 1px solid var(--border-default);
+  }
+
+  .table-row {
+    min-height: 38px;
+    display: grid;
+    grid-template-columns: 48px minmax(240px, 1.7fr) 96px 100px 86px 110px 86px;
+    gap: 8px;
+    align-items: center;
+    padding: 0 12px;
+    border: 0;
+    border-bottom: 1px solid var(--border-default);
+    border-radius: 0;
+    background: transparent;
+  }
+
+  .table-row.header {
+    min-height: 32px;
+    color: var(--text-tertiary);
+    background: var(--bg-app);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+
+  .model-row {
+    color: var(--text-secondary);
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .model-status-dot {
+    width: 9px;
+    height: 9px;
+    display: inline-block;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-pill);
+    background: var(--text-tertiary);
+  }
+
+  .model-status-dot.online-dot {
+    border-color: color-mix(in srgb, var(--accent-primary) 64%, var(--border-default));
+    background: var(--accent-primary);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-primary) 13%, transparent);
+  }
+
+  .quant-badge {
+    width: fit-content;
+    max-width: 100%;
+    padding: 2px 6px;
+    border: 1px solid color-mix(in srgb, var(--accent-info) 32%, var(--border-default));
+    border-radius: var(--radius-pill);
+    color: var(--accent-info);
+    background: color-mix(in srgb, var(--accent-info) 8%, transparent);
+  }
+
+  .row-action {
+    height: 28px;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-sm);
+    color: #020617;
+    background: var(--accent-primary);
+    font-size: var(--text-xs);
+    font-weight: 750;
+    cursor: pointer;
+  }
+
+  .row-action.danger {
+    color: #020617;
+    background: var(--accent-warning);
+  }
+
+  .model-name-cell strong,
+  .model-name-cell small,
+  .endpoint-row span,
+  .endpoint-row small,
+  .stat-row span,
+  .stat-row code,
+  .statusbar span,
+  .statusbar code {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  code,
+  pre,
+  .log-console,
+  .log-line,
+  .statusbar {
+    font-family: var(--font-mono);
+  }
+
+  pre,
+  .log-console {
+    border-color: var(--border-default);
+    background: var(--bg-app);
+  }
+
+  .log-console {
+    padding: 10px;
+    font-size: 12px;
+    line-height: 1.4;
+  }
+
+  .log-line {
+    min-height: 24px;
+    grid-template-columns: 116px 58px 110px minmax(0, 1fr);
+    border-bottom: 1px solid color-mix(in srgb, var(--border-default) 70%, transparent);
+  }
+
+  .log-line strong {
+    color: var(--accent-info);
+  }
+
+  .log-line.warn strong {
+    color: var(--accent-warning);
+  }
+
+  .log-line.error strong {
+    color: var(--accent-danger);
+  }
+
+  .chat-panel,
+  .prompt-panel,
+  .context-strip,
+  .metric-stack,
+  .inspector-section {
+    border-color: var(--border-default);
+    border-radius: var(--radius-md);
+    background: var(--bg-panel);
+  }
+
+  .message.user {
+    width: min(760px, 82%);
+    margin-left: auto;
+    padding: 10px 12px;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-md);
+    background: var(--bg-elevated);
+  }
+
+  .message.assistant {
+    width: min(860px, 94%);
+    border-bottom: 1px solid var(--border-default);
+    background: transparent;
+  }
+
+  .message.system {
+    max-width: 100%;
+    padding: 8px 10px;
+    border: 1px dashed var(--border-default);
+    border-radius: var(--radius-sm);
+    color: var(--text-tertiary);
+    background: color-mix(in srgb, var(--bg-elevated) 50%, transparent);
+  }
+
+  .message.streaming::after {
+    content: "";
+    display: inline-block;
+    width: 2px;
+    height: 1em;
+    margin-left: 3px;
+    vertical-align: -0.15em;
+    background: var(--accent-info);
+    animation: cockpit-caret 900ms steps(2, start) infinite;
+  }
+
+  .prompt-dock {
+    padding: 0 14px 14px;
+  }
+
+  .prompt-row {
+    grid-template-columns: minmax(0, 1fr) 240px 44px;
+    align-items: stretch;
+  }
+
+  .prompt-row textarea {
+    min-height: 72px;
+    max-height: 200px;
+    padding: 10px 12px;
+    border-color: var(--border-strong);
+    resize: vertical;
+  }
+
+  .prompt-tools {
+    display: grid;
+    grid-template-rows: 32px minmax(0, 1fr);
+    gap: 8px;
+  }
+
+  .prompt-tools label {
+    min-height: 32px;
+    display: grid;
+    grid-template-columns: 42px minmax(0, 1fr) 42px;
+    align-items: center;
+    gap: 8px;
+    padding: 0 8px;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated);
+    text-transform: none;
+  }
+
+  .prompt-tools input[type="range"] {
+    height: auto;
+    padding: 0;
+  }
+
+  .prompt-tools code {
+    color: var(--accent-info);
+    font-size: var(--text-xs);
+    text-align: right;
+  }
+
+  .message .stream-cursor {
+    display: none;
+  }
+
+  @keyframes cockpit-caret {
+    50% {
+      opacity: 0;
+    }
+  }
+
+  .segment-bar,
+  .memory-bar,
+  .mini-bar,
+  .status-meter {
+    overflow: hidden;
+    border: 1px solid var(--border-default);
+    background: var(--bg-app);
+  }
+
+  .statusbar {
+    height: 24px;
+    border-top: 1px solid var(--border-default);
+    background: var(--bg-app);
+    color: var(--text-tertiary);
+    font-size: var(--text-xs);
+  }
+
+  .statusbar .online {
+    color: var(--accent-primary);
+  }
+
+  .command-palette {
+    border-color: var(--border-strong);
+    border-radius: var(--radius-md);
+    background: var(--bg-panel);
+    box-shadow: 0 24px 80px rgba(0, 0, 0, 0.46);
+  }
+
+  .palette-input,
+  .palette-results button {
+    border-color: var(--border-default);
+  }
+
+  .palette-results button:hover {
+    color: var(--text-primary);
+    background: var(--bg-elevated);
+  }
+
   @media (max-width: 1200px) {
     .shell {
-      grid-template-columns: 56px 240px minmax(0, 1fr) 260px;
+      grid-template-columns: 48px 240px minmax(0, 1fr) 0;
+    }
+
+    .inspector {
+      border-left: 0;
+      pointer-events: none;
     }
 
     .blueprint-grid,
@@ -3326,6 +3986,50 @@
 
     .tuning-grid,
     .schema-editor {
+      grid-template-columns: 1fr;
+    }
+
+    .prompt-row {
+      grid-template-columns: minmax(0, 1fr) 44px;
+    }
+
+    .prompt-tools {
+      grid-column: 1 / -1;
+      grid-row: 2;
+      grid-template-columns: minmax(0, 1fr) minmax(180px, 0.6fr);
+      grid-template-rows: auto;
+    }
+  }
+
+  @media (max-width: 900px) {
+    .titlebar {
+      grid-template-columns: 96px minmax(0, 1fr) 140px;
+    }
+
+    .title-command {
+      display: none;
+    }
+
+    .shell,
+    .shell.right-collapsed {
+      grid-template-columns: 48px 0 minmax(0, 1fr) 0;
+    }
+
+    .context-panel,
+    .inspector {
+      border: 0;
+      pointer-events: none;
+    }
+
+    .table-row,
+    .endpoint-row,
+    .log-line {
+      grid-template-columns: minmax(0, 1fr);
+      gap: 4px;
+      padding: 8px 10px;
+    }
+
+    .prompt-tools {
       grid-template-columns: 1fr;
     }
   }

@@ -5,7 +5,7 @@ Kivarro is a Rust/Tauri local model inference workstation for Windows, macOS, an
 ## Current baseline
 
 - Tauri v2 desktop app with SvelteKit and TypeScript.
-- Custom Kivarro application shell with nav rail, contextual panel, workspace, inspector, and status bar.
+- Engineering Cockpit UI shell with dense nav rail, contextual panel, workspace, inspector, status bar, and strict design tokens.
 - Implemented views for Command Center, Model Registry, Hardware Fit, Expert Tuning, RAG Knowledge Bases, Agents, Local API, Benchmarks, Logs, and Settings.
 - Rust commands for CPU/RAM telemetry, local model discovery/import under `./models`, GGUF metadata indexing, API endpoint metadata, logs, and persisted benchmark result surfaces.
 - Cross-platform accelerator discovery with NVIDIA SMI live utilization/VRAM telemetry and OS fallbacks for Windows, macOS, and Linux GPU inventory.
