@@ -34,7 +34,6 @@
     Sun,
     Terminal,
     Upload,
-    Wrench,
     X,
     Zap,
   } from "@lucide/svelte";
@@ -842,6 +841,22 @@
     return value && value > 0 ? `${value}` : "estimated";
   }
 
+  function scopePoints(utilization: number | null | undefined, channel = 0) {
+    const base = 100 - clamp(utilization ?? 0, 0, 100);
+    return Array.from({ length: 16 }, (_, index) => {
+      const x = (index / 15) * 100;
+      const phase = index * 0.72 + channel * 0.9;
+      const pulse = Math.sin(phase) * 9 + Math.cos(phase * 0.53) * 5;
+      const y = clamp(base + pulse, 8, 92);
+      return `${formatNumber(x, 2)},${formatNumber(y, 2)}`;
+    }).join(" ");
+  }
+
+  function benchmarkBarWidth(value: number | null | undefined) {
+    const peak = Math.max(...benchmarks.map((result) => result.tokensPerSecond), 1);
+    return clamp(((value ?? 0) / peak) * 100, 2, 100);
+  }
+
   function createId(prefix: string) {
     return `${prefix}-${globalThis.crypto?.randomUUID?.() ?? Date.now().toString(36)}`;
   }
@@ -1237,6 +1252,48 @@
           <button onclick={() => jumpToWorkspaceSection("tuning-runtime")}>Runtime</button>
           <button onclick={() => jumpToWorkspaceSection("tuning-json")}>Live JSON</button>
         </div>
+      {:else if activeView === "agents"}
+        <div class="section-label">Agent workspace</div>
+        <div class="context-stat">
+          <span>Draft agent</span>
+          <code>Analyst Agent</code>
+        </div>
+        <div class="context-stat">
+          <span>Tool gates</span>
+          <code>{agentTools.length} configured</code>
+        </div>
+        <div class="jump-list">
+          <button onclick={() => jumpToWorkspaceSection("agent-contract")}>System Contract</button>
+          <button onclick={() => jumpToWorkspaceSection("agent-tools")}>Tool Schemas</button>
+        </div>
+      {:else if activeView === "api"}
+        <div class="section-label">Gateway</div>
+        <div class="context-stat">
+          <span>Status</span>
+          <code>{apiStatus?.enabled ? "running" : "stopped"}</code>
+        </div>
+        <div class="context-stat">
+          <span>Base URL</span>
+          <code>{configuredBaseUrl}</code>
+        </div>
+        <div class="context-stat">
+          <span>Routes</span>
+          <code>{apiStatus?.endpoints?.length ?? 0}</code>
+        </div>
+      {:else if activeView === "benchmarks"}
+        <div class="section-label">Run summary</div>
+        <div class="context-stat">
+          <span>Runs</span>
+          <code>{formatTokens(benchmarks.length)}</code>
+        </div>
+        <div class="context-stat">
+          <span>Latest tok/s</span>
+          <code>{formatNumber(benchmarks[0]?.tokensPerSecond ?? 0)}</code>
+        </div>
+        <div class="context-stat">
+          <span>Active model</span>
+          <code>{metrics?.activeModel ?? "none"}</code>
+        </div>
       {:else if activeView === "settings"}
         <div class="section-label">Settings categories</div>
         <div class="jump-list">
@@ -1524,18 +1581,28 @@
           </button>
         </section>
 
-        <section class="blueprint-grid">
-          {#each hardware?.blocks ?? [] as block}
-            <article class="compute-block">
-              <div class="block-top">
+        <section class="telemetry-board">
+          {#each hardware?.blocks ?? [] as block, index}
+            <article class="scope-panel">
+              <div class="scope-head">
                 <span>{block.kind}</span>
-                <code>{formatNumber(block.utilizationPercent)}%</code>
+                <strong>{formatNumber(block.utilizationPercent)}%</strong>
               </div>
-              <h2>{block.name}</h2>
-              <p>{block.status}</p>
+              <svg class="scope-line" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+                <polyline points={scopePoints(block.utilizationPercent, index)}></polyline>
+              </svg>
+              <div class="scope-axis">
+                <span>0s</span>
+                <span>5s</span>
+                <span>10s</span>
+              </div>
+              <div class="scope-meta">
+                <strong>{block.name}</strong>
+                <span>{block.status}</span>
+              </div>
               {#if block.memoryTotalGib}
                 <div class="memory-bar">
-                  <span style={`width: ${(block.memoryUsedGib ?? 0) / block.memoryTotalGib * 100}%`}></span>
+                  <span style={`width: ${((block.memoryUsedGib ?? 0) / block.memoryTotalGib) * 100}%`}></span>
                 </div>
                 <code>{formatNumber(block.memoryUsedGib ?? 0)} / {formatNumber(block.memoryTotalGib)} GiB</code>
               {/if}
@@ -1546,31 +1613,52 @@
         <section class="control-band">
           <div>
             <label for="gpu-layers">GPU offload layers</label>
-            <input
-              id="gpu-layers"
-              type="range"
-              min="0"
-              max={loadPlan?.estimatedLayers ?? 96}
-              step="1"
-              bind:value={sampling.gpuLayers}
-              onchange={() => void updateLoadPlan()}
-            />
-            <code>
-              {sampling.gpuLayers} layers / {loadPlan?.estimatedLayers ?? 96}
-              {loadPlan?.metadataSource?.startsWith("GGUF") ? "from GGUF" : "estimated"}
-            </code>
+            <div class="precise-slider">
+              <input
+                id="gpu-layers"
+                type="range"
+                min="0"
+                max={loadPlan?.estimatedLayers ?? 96}
+                step="1"
+                bind:value={sampling.gpuLayers}
+                onchange={() => void updateLoadPlan()}
+              />
+              <input
+                aria-label="GPU offload layers value"
+                class="number-input"
+                type="number"
+                min="0"
+                max={loadPlan?.estimatedLayers ?? 96}
+                step="1"
+                bind:value={sampling.gpuLayers}
+                onchange={() => void updateLoadPlan()}
+              />
+            </div>
+            <code>{loadPlan?.estimatedLayers ?? 96} layers / {loadPlan?.metadataSource?.startsWith("GGUF") ? "from GGUF" : "estimated"}</code>
           </div>
           <div>
             <label for="context-length">Context length</label>
-            <input
-              id="context-length"
-              type="range"
-              min="4096"
-              max="262144"
-              step="4096"
-              bind:value={sampling.contextLength}
-              onchange={() => void updateLoadPlan()}
-            />
+            <div class="precise-slider">
+              <input
+                id="context-length"
+                type="range"
+                min="4096"
+                max="262144"
+                step="4096"
+                bind:value={sampling.contextLength}
+                onchange={() => void updateLoadPlan()}
+              />
+              <input
+                aria-label="Context length value"
+                class="number-input"
+                type="number"
+                min="4096"
+                max="262144"
+                step="4096"
+                bind:value={sampling.contextLength}
+                onchange={() => void updateLoadPlan()}
+              />
+            </div>
             <code>{formatTokens(sampling.contextLength)} tokens</code>
           </div>
         </section>
@@ -1844,31 +1932,43 @@
           </button>
         </section>
 
-        <section class="agent-canvas">
-          <article class="agent-node">
-            <BrainCircuit size={22} />
-            <strong>Analyst Agent</strong>
-            <span>Persona, model, tools, and RAG attachments.</span>
-          </article>
-          <article class="agent-node">
-            <Database size={22} />
-            <strong>Knowledge</strong>
-            <span>Attach local vector stores with citation requirements.</span>
-          </article>
-          <article class="agent-node">
-            <Wrench size={22} />
-            <strong>Tools</strong>
-            <span>Gate execution with explicit permissions.</span>
-          </article>
-        </section>
-
-        <section class="tool-permissions">
-          {#each agentTools as tool}
-            <label class:danger={tool.danger}>
-              <span>{tool.name}</span>
-              <input type="checkbox" checked={tool.enabled} />
+        <section class="agent-workbench">
+          <aside class="agent-list">
+            <div class="panel-header inline"><span>Agents</span><code>1 draft</code></div>
+            <button class="agent-row active">
+              <BrainCircuit size={16} />
+              <span>
+                <strong>Analyst Agent</strong>
+                <small>local model / approval-gated tools</small>
+              </span>
+              <code>draft</code>
+            </button>
+          </aside>
+          <article class="agent-detail" id="agent-contract">
+            <div class="panel-header inline"><span>System Contract</span><code>{activeProfile.id}</code></div>
+            <label>
+              <span>Name</span>
+              <input value="Analyst Agent" aria-label="Agent name" />
             </label>
-          {/each}
+            <label>
+              <span>System prompt</span>
+              <textarea aria-label="Agent system prompt">{activeProfile.systemPrompt}</textarea>
+            </label>
+            <pre>{JSON.stringify({ model: selectedModel?.name ?? "unloaded", profile: activeProfile.id, knowledgeBase: activeKnowledgeBase?.name ?? "none", approvals: "required" }, null, 2)}</pre>
+          </article>
+          <aside class="tool-schema-list" id="agent-tools">
+            <div class="panel-header inline"><span>Tools</span><code>{agentTools.length} available</code></div>
+            {#each agentTools as tool}
+              <label class:danger={tool.danger} class="tool-schema-row">
+                <span>
+                  <strong>{tool.name}</strong>
+                  <small>{tool.danger ? "Explicit approval required" : "User controlled"}</small>
+                </span>
+                <input type="checkbox" checked={tool.enabled} />
+              </label>
+              <pre>{JSON.stringify({ name: tool.name, enabled: tool.enabled, risk: tool.danger ? "high" : "normal" }, null, 2)}</pre>
+            {/each}
+          </aside>
         </section>
       {:else if activeView === "api"}
         <section class="workspace-header">
@@ -1888,6 +1988,14 @@
         </section>
 
         <section class:online={apiStatus?.enabled} class="api-dashboard">
+          <div class="api-status-strip">
+            <span>{apiStatus?.enabled ? "Running" : "Stopped"}</span>
+            <code>{configuredBaseUrl}</code>
+            <button aria-label="Copy base URL" onclick={copyBaseUrl}>
+              <Clipboard size={15} />
+              <small>{apiCopyStatus}</small>
+            </button>
+          </div>
           <div class="api-config-grid">
             <label>
               <span>Host</span>
@@ -1917,31 +2025,29 @@
           {#if apiEndpointLocked}
             <p class="muted-copy">Stop the running local API server before changing host or port.</p>
           {/if}
-          <div class="api-url">
-            <span>Base URL</span>
-            <code>{configuredBaseUrl}</code>
-            <button aria-label="Copy base URL" onclick={copyBaseUrl}>
-              <Clipboard size={15} />
-              <small>{apiCopyStatus}</small>
-            </button>
-          </div>
-          <div class="endpoint-table">
-            {#each apiStatus?.endpoints ?? [] as endpoint}
-              <div class="endpoint-row">
-                <code>{endpoint.method}</code>
-                <span>{endpoint.path}</span>
-                <small>{endpoint.description}</small>
-                <em>{endpoint.status}</em>
-              </div>
-            {/each}
-          </div>
-          <pre class="curl-block">{`curl ${configuredBaseUrl}/chat/completions \\
+          <div class="api-split">
+            <div class="endpoint-table">
+              <div class="panel-header inline"><span>Endpoints</span><code>{apiStatus?.endpoints?.length ?? 0} routes</code></div>
+              {#each apiStatus?.endpoints ?? [] as endpoint}
+                <div class="endpoint-row">
+                  <code>{endpoint.method}</code>
+                  <span>{endpoint.path}</span>
+                  <small>{endpoint.description}</small>
+                  <em>{endpoint.status}</em>
+                </div>
+              {/each}
+            </div>
+            <div class="api-example">
+              <div class="panel-header inline"><span>cURL Example</span><code>stream</code></div>
+              <pre class="curl-block">{`curl ${configuredBaseUrl}/chat/completions \\
   -H "Content-Type: application/json" \\
   -d '{
     "model": "${engineStatus?.activeModelName ?? "local-model"}",
     "messages": [{ "role": "user", "content": "ping" }],
     "stream": true
   }'`}</pre>
+            </div>
+          </div>
         </section>
       {:else if activeView === "benchmarks"}
         <section class="workspace-header">
@@ -1982,13 +2088,20 @@
           </section>
         {:else}
           <section class="benchmark-bars">
+            <div class="benchmark-row benchmark-head">
+              <span>Model</span>
+              <span>Throughput</span>
+              <span>Backend</span>
+              <span>Tokens</span>
+              <span>Load</span>
+            </div>
             {#each benchmarks as result}
-              <div>
+              <div class="benchmark-row">
                 <span>{result.model}</span>
-                <i style={`width: ${Math.min(result.tokensPerSecond, 160)}%`}></i>
-                <code>
-                  {formatNumber(result.tokensPerSecond)} tok/s · {formatTokens(result.evalCount)} eval · {formatNumber(result.evalDurationMs / 1000)}s
-                </code>
+                <i style={`width: ${benchmarkBarWidth(result.tokensPerSecond)}%`} title={`${formatNumber(result.tokensPerSecond)} tok/s`}></i>
+                <code>{result.backend}</code>
+                <code>{formatTokens(result.evalCount)} eval</code>
+                <code>{formatNumber(result.loadDurationMs / 1000)}s</code>
               </div>
             {/each}
           </section>
@@ -2087,6 +2200,13 @@
             </label>
             <button class="primary-button" disabled={apiConfigBusy || apiEndpointLocked} onclick={saveCurrentApiSettings}>Save API endpoint</button>
           </article>
+          <div class="settings-savebar">
+            <span>{apiEndpointLocked ? "Stop the local API server before endpoint changes." : "Settings changes are ready to save."}</span>
+            <button class="primary-button" disabled={apiConfigBusy || apiEndpointLocked} onclick={saveCurrentApiSettings}>
+              <Clipboard size={15} />
+              Save settings
+            </button>
+          </div>
         </section>
       {/if}
     </main>
@@ -2833,7 +2953,6 @@
   .chat-pane,
   .model-table,
   .load-plan,
-  .compute-block,
   .control-band,
   .hardware-plan,
   .profile-strip,
@@ -2841,7 +2960,6 @@
   .distribution-panel,
   .schema-editor > div,
   .rag-grid article,
-  .agent-node,
   .api-dashboard,
   .log-console {
     border: 1px solid var(--border);
@@ -3106,11 +3224,6 @@
     gap: 12px;
   }
 
-  .compute-block {
-    min-height: 190px;
-    padding: 14px;
-  }
-
   .block-top,
   .stat-row,
   .context-readout {
@@ -3118,18 +3231,6 @@
     align-items: center;
     justify-content: space-between;
     gap: 8px;
-  }
-
-  .compute-block h2 {
-    margin: 18px 0 8px;
-    font-size: 15px;
-  }
-
-  .compute-block p {
-    min-height: 36px;
-    margin: 0 0 16px;
-    color: var(--muted);
-    font-size: 12px;
   }
 
   .memory-bar {
@@ -3477,41 +3578,6 @@
     align-items: center;
   }
 
-  .agent-node {
-    min-height: 150px;
-    display: grid;
-    align-content: center;
-    justify-items: center;
-    gap: 10px;
-    padding: 16px;
-    text-align: center;
-  }
-
-  .agent-node span {
-    color: var(--muted);
-    font-size: 12px;
-  }
-
-  .tool-permissions {
-    display: grid;
-    grid-template-columns: repeat(4, minmax(0, 1fr));
-    gap: 10px;
-  }
-
-  .tool-permissions label {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    padding: 12px;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    background: var(--panel);
-  }
-
-  .tool-permissions label.danger {
-    border-color: color-mix(in srgb, var(--red) 30%, var(--border));
-  }
-
   .api-dashboard {
     display: grid;
     gap: 12px;
@@ -3532,23 +3598,6 @@
 
   .api-url {
     grid-template-columns: 90px minmax(0, 1fr) 92px;
-  }
-
-  .api-url button {
-    height: 30px;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 6px;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    background: var(--panel-2);
-    color: var(--text);
-  }
-
-  .api-url small {
-    font-size: 11px;
-    color: var(--muted);
   }
 
   .endpoint-table {
@@ -4209,9 +4258,6 @@
   .document-list div,
   .retrieval-results article,
   .rag-metric-grid div,
-  .compute-block,
-  .agent-node,
-  .tool-permissions label,
   .load-plan,
   .hardware-plan,
   .profile-strip,
@@ -4666,30 +4712,6 @@
     padding: 14px;
   }
 
-  .agent-node {
-    position: relative;
-  }
-
-  .agent-node::before,
-  .agent-node::after {
-    content: "";
-    position: absolute;
-    top: 50%;
-    width: 8px;
-    height: 8px;
-    border: 1px solid var(--accent-info);
-    border-radius: var(--radius-pill);
-    background: var(--bg-panel);
-  }
-
-  .agent-node::before {
-    left: -5px;
-  }
-
-  .agent-node::after {
-    right: -5px;
-  }
-
   @media (max-width: 1439px) {
     .shell {
       grid-template-columns: 64px 280px minmax(0, 1fr) 0;
@@ -4702,8 +4724,6 @@
 
     .blueprint-grid,
     .rag-grid,
-    .agent-canvas,
-    .tool-permissions,
     .api-config-grid,
     .load-plan-grid,
     .allocation-grid,
@@ -4766,6 +4786,432 @@
 
     .prompt-tools {
       grid-template-columns: 1fr;
+    }
+  }
+
+  /* Instrument workbench refinement layer */
+  .telemetry-board {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr));
+    gap: 0;
+    margin: 14px;
+    border-top: 1px solid var(--border-default);
+    border-left: 1px solid var(--border-default);
+    background: var(--bg-app);
+  }
+
+  .scope-panel {
+    min-height: 252px;
+    display: grid;
+    grid-template-rows: 32px minmax(118px, 1fr) 18px auto auto auto;
+    gap: 8px;
+    padding: 10px;
+    border-right: 1px solid var(--border-default);
+    border-bottom: 1px solid var(--border-default);
+    background: var(--bg-panel);
+  }
+
+  .scope-head,
+  .scope-axis,
+  .scope-meta {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    min-width: 0;
+  }
+
+  .scope-head span,
+  .scope-axis,
+  .scope-meta span,
+  .scope-panel code {
+    color: var(--text-tertiary);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+  }
+
+  .scope-head strong,
+  .scope-meta strong {
+    overflow: hidden;
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .scope-line {
+    width: 100%;
+    height: 100%;
+    min-height: 118px;
+    border: 1px solid var(--border-default);
+    background:
+      linear-gradient(var(--border-default) 1px, transparent 1px),
+      linear-gradient(90deg, var(--border-default) 1px, transparent 1px),
+      var(--bg-app);
+    background-size: 24px 24px;
+  }
+
+  .scope-line polyline {
+    fill: none;
+    stroke: var(--accent-primary);
+    stroke-linecap: square;
+    stroke-linejoin: miter;
+    stroke-width: 1;
+    vector-effect: non-scaling-stroke;
+  }
+
+  .precise-slider {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 92px;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .memory-bar,
+  .segment-bar {
+    height: 10px;
+    border-radius: var(--radius-sm);
+  }
+
+  .memory-bar span,
+  .segment-bar span {
+    background: var(--accent-primary);
+  }
+
+  .control-band,
+  .hardware-plan {
+    margin-right: 14px;
+    margin-left: 14px;
+    border-radius: var(--radius-sm);
+  }
+
+  .agent-workbench {
+    min-height: 0;
+    display: grid;
+    grid-template-columns: 240px minmax(0, 1fr) 320px;
+    gap: 0;
+    margin: 14px;
+    border: 1px solid var(--border-default);
+    background: var(--bg-panel);
+  }
+
+  .agent-list,
+  .agent-detail,
+  .tool-schema-list {
+    min-width: 0;
+    display: grid;
+    align-content: start;
+    gap: 10px;
+    padding: 12px;
+  }
+
+  .agent-detail,
+  .tool-schema-list {
+    border-left: 1px solid var(--border-default);
+  }
+
+  .agent-row,
+  .tool-schema-row {
+    width: 100%;
+    min-height: 40px;
+    display: grid;
+    align-items: center;
+    gap: 8px;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-sm);
+    color: var(--text-secondary);
+    background: var(--bg-elevated);
+  }
+
+  .agent-row {
+    grid-template-columns: 20px minmax(0, 1fr) auto;
+    padding: 8px;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .agent-row.active {
+    border-color: var(--border-strong);
+    color: var(--text-primary);
+    background: var(--bg-active);
+  }
+
+  .agent-row span,
+  .tool-schema-row span {
+    min-width: 0;
+    display: grid;
+    gap: 2px;
+  }
+
+  .agent-row strong,
+  .agent-row small,
+  .tool-schema-row strong,
+  .tool-schema-row small {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .agent-row small,
+  .tool-schema-row small {
+    color: var(--text-tertiary);
+    font-size: var(--text-xs);
+  }
+
+  .agent-detail label {
+    display: grid;
+    gap: 6px;
+    text-transform: none;
+  }
+
+  .agent-detail textarea {
+    min-height: 128px;
+    resize: vertical;
+  }
+
+  .tool-schema-row {
+    grid-template-columns: minmax(0, 1fr) 22px;
+    padding: 8px;
+  }
+
+  .tool-schema-row.danger {
+    border-color: color-mix(in srgb, var(--accent-danger) 42%, var(--border-default));
+  }
+
+  .tool-schema-list pre,
+  .agent-detail pre {
+    min-height: auto;
+    max-height: 180px;
+    border-radius: var(--radius-sm);
+    font-size: var(--text-xs);
+  }
+
+  .api-dashboard {
+    width: auto;
+    margin: 14px;
+    padding: 0;
+    border-radius: var(--radius-sm);
+    background: var(--bg-panel);
+  }
+
+  .api-dashboard::before {
+    display: none;
+  }
+
+  .api-status-strip {
+    min-height: 38px;
+    display: grid;
+    grid-template-columns: 108px minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 10px;
+    padding: 0 12px;
+    border-bottom: 1px solid var(--border-default);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+  }
+
+  .api-status-strip span {
+    color: var(--accent-danger);
+    text-transform: uppercase;
+  }
+
+  .api-dashboard.online .api-status-strip span {
+    color: var(--accent-primary);
+  }
+
+  .api-status-strip code {
+    overflow: hidden;
+    color: var(--text-secondary);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .api-status-strip button {
+    height: 28px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 0 9px;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-sm);
+    color: var(--text-primary);
+    background: var(--bg-elevated);
+    cursor: pointer;
+  }
+
+  .api-config-grid {
+    grid-template-columns: minmax(0, 1.2fr) minmax(120px, 0.45fr) auto;
+    padding: 12px;
+    border-bottom: 1px solid var(--border-default);
+  }
+
+  .api-split {
+    display: grid;
+    grid-template-columns: minmax(320px, 0.92fr) minmax(0, 1.08fr);
+    min-height: 360px;
+  }
+
+  .api-split .endpoint-table,
+  .api-example {
+    min-width: 0;
+    padding: 12px;
+  }
+
+  .api-example {
+    border-left: 1px solid var(--border-default);
+  }
+
+  .endpoint-row {
+    min-height: 36px;
+    border-radius: var(--radius-sm);
+    background: var(--bg-elevated);
+  }
+
+  .curl-block {
+    height: calc(100% - 28px);
+    min-height: 260px;
+    border-radius: var(--radius-sm);
+    white-space: pre;
+  }
+
+  .benchmark-metrics {
+    gap: 0;
+    margin: 14px 14px 0;
+    padding: 0;
+    border-top: 1px solid var(--border-default);
+    border-left: 1px solid var(--border-default);
+  }
+
+  .benchmark-metrics article {
+    min-height: 72px;
+    border-width: 0 1px 1px 0;
+    border-radius: 0;
+    background: var(--bg-panel);
+  }
+
+  .benchmark-bars {
+    display: grid;
+    gap: 0;
+    margin: 0 14px 14px;
+    border-top: 1px solid var(--border-default);
+    border-left: 1px solid var(--border-default);
+    background: var(--bg-panel);
+  }
+
+  .benchmark-bars .benchmark-row {
+    min-height: 38px;
+    display: grid;
+    grid-template-columns: minmax(220px, 1.2fr) minmax(160px, 1fr) 110px 110px 76px;
+    gap: 10px;
+    align-items: center;
+    padding: 0 12px;
+    border-right: 1px solid var(--border-default);
+    border-bottom: 1px solid var(--border-default);
+  }
+
+  .benchmark-head {
+    color: var(--text-tertiary);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    background: var(--bg-app);
+  }
+
+  .benchmark-bars .benchmark-row > * {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .benchmark-bars i {
+    height: 12px;
+    display: block;
+    border-radius: var(--radius-sm);
+    background: var(--accent-primary);
+  }
+
+  .settings-workspace {
+    gap: 0;
+    padding: 14px 14px 64px;
+    align-content: start;
+  }
+
+  .settings-workspace article {
+    min-height: 190px;
+    border-radius: var(--radius-sm);
+  }
+
+  .settings-savebar {
+    position: sticky;
+    bottom: 0;
+    z-index: 2;
+    grid-column: 1 / -1;
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 6px 10px;
+    border: 1px solid var(--border-default);
+    border-top: 0;
+    color: var(--text-secondary);
+    background: var(--bg-app);
+    font-size: var(--text-xs);
+  }
+
+  @media (max-width: 1439px) {
+    .telemetry-board,
+    .agent-workbench,
+    .api-split {
+      grid-template-columns: 1fr;
+    }
+
+    .agent-detail,
+    .tool-schema-list,
+    .api-example {
+      border-left: 0;
+      border-top: 1px solid var(--border-default);
+    }
+
+    .benchmark-metrics {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+  }
+
+  @media (max-width: 1279px) {
+    .telemetry-board,
+    .agent-workbench,
+    .api-dashboard,
+    .benchmark-metrics,
+    .benchmark-bars {
+      margin-right: 10px;
+      margin-left: 10px;
+    }
+
+    .benchmark-bars .benchmark-row {
+      grid-template-columns: minmax(0, 1fr);
+      gap: 4px;
+      padding: 8px 10px;
+    }
+
+    .benchmark-head {
+      display: none;
+    }
+
+    .api-status-strip,
+    .precise-slider,
+    .api-config-grid {
+      grid-template-columns: 1fr;
+      align-items: start;
+      padding-top: 8px;
+      padding-bottom: 8px;
+    }
+
+    .settings-savebar {
+      align-items: stretch;
+      flex-direction: column;
     }
   }
 </style>
