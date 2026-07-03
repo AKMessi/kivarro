@@ -1056,11 +1056,7 @@ fn save_inference_profile(
     validate_profile(&profile)?;
 
     let path = directory.join(format!("{}.{}", profile.id, PROFILE_EXTENSION));
-    let encoded = serde_json::to_string_pretty(&profile)
-        .map_err(|err| format!("failed to encode profile {}: {err}", profile.id))?;
-
-    fs::write(&path, encoded)
-        .map_err(|err| format!("failed to write profile {}: {err}", path.display()))?;
+    write_json_file(&path, &profile, &format!("profile {}", profile.id))?;
 
     let _ = append_system_log(
         &app_handle,
@@ -2084,6 +2080,127 @@ fn profile_directory(app_handle: &AppHandle) -> Result<PathBuf, String> {
         .map_err(|err| format!("failed to resolve app profile directory: {err}"))
 }
 
+fn write_json_file<T>(path: &Path, value: &T, label: &str) -> Result<(), String>
+where
+    T: Serialize + ?Sized,
+{
+    let encoded = serde_json::to_string_pretty(value)
+        .map_err(|err| format!("failed to encode {label}: {err}"))?;
+    atomic_write_text(path, &encoded, label)
+}
+
+fn atomic_write_text(path: &Path, contents: &str, label: &str) -> Result<(), String> {
+    let Some(directory) = path.parent() else {
+        return Err(format!("{label} path has no parent directory"));
+    };
+    fs::create_dir_all(directory).map_err(|err| {
+        format!(
+            "failed to create {label} directory {}: {err}",
+            directory.display()
+        )
+    })?;
+
+    let temp_path = unique_sidecar_path(path, "tmp");
+    let write_result = (|| {
+        let mut file = File::create(&temp_path).map_err(|err| {
+            format!(
+                "failed to create temporary {label} {}: {err}",
+                temp_path.display()
+            )
+        })?;
+        std::io::Write::write_all(&mut file, contents.as_bytes()).map_err(|err| {
+            format!(
+                "failed to write temporary {label} {}: {err}",
+                temp_path.display()
+            )
+        })?;
+        file.sync_all().map_err(|err| {
+            format!(
+                "failed to sync temporary {label} {}: {err}",
+                temp_path.display()
+            )
+        })?;
+        drop(file);
+
+        replace_with_temp_file(path, &temp_path, label)
+    })();
+
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+
+    write_result
+}
+
+fn unique_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("kivarro-data");
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+
+    directory.join(format!(
+        ".{file_name}.{}.{}.{}",
+        std::process::id(),
+        unique,
+        suffix
+    ))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn replace_with_temp_file(path: &Path, temp_path: &Path, label: &str) -> Result<(), String> {
+    fs::rename(temp_path, path).map_err(|err| {
+        format!(
+            "failed to replace {label} {} with {}: {err}",
+            path.display(),
+            temp_path.display()
+        )
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn replace_with_temp_file(path: &Path, temp_path: &Path, label: &str) -> Result<(), String> {
+    let backup_path = unique_sidecar_path(path, "bak");
+    let had_existing = path.exists();
+    if had_existing {
+        fs::rename(path, &backup_path).map_err(|err| {
+            format!(
+                "failed to stage existing {label} {} as {}: {err}",
+                path.display(),
+                backup_path.display()
+            )
+        })?;
+    }
+
+    match fs::rename(temp_path, path) {
+        Ok(()) => {
+            if had_existing {
+                let _ = fs::remove_file(&backup_path);
+            }
+            Ok(())
+        }
+        Err(err) => {
+            if had_existing {
+                if let Err(restore_err) = fs::rename(&backup_path, path) {
+                    return Err(format!(
+                        "failed to replace {label} {}: {err}; also failed to restore backup {}: {restore_err}",
+                        path.display(),
+                        backup_path.display()
+                    ));
+                }
+            }
+            Err(format!(
+                "failed to replace {label} {}: {err}",
+                path.display()
+            ))
+        }
+    }
+}
+
 fn system_logs_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
     app_handle
         .path()
@@ -2122,10 +2239,7 @@ fn write_system_logs(app_handle: &AppHandle, logs: &[LogEntry]) -> Result<(), St
             directory.display()
         )
     })?;
-    let encoded = serde_json::to_string_pretty(logs)
-        .map_err(|err| format!("failed to encode system logs: {err}"))?;
-    fs::write(&path, encoded)
-        .map_err(|err| format!("failed to write system logs {}: {err}", path.display()))
+    write_json_file(&path, logs, "system logs")
 }
 
 fn append_system_log(
@@ -2219,10 +2333,7 @@ fn write_api_settings(app_handle: &AppHandle, settings: &ApiSettings) -> Result<
             directory.display()
         )
     })?;
-    let encoded = serde_json::to_string_pretty(settings)
-        .map_err(|err| format!("failed to encode API settings: {err}"))?;
-    fs::write(&path, encoded)
-        .map_err(|err| format!("failed to write API settings {}: {err}", path.display()))
+    write_json_file(&path, settings, "API settings")
 }
 
 fn normalize_api_settings(settings: ApiSettings) -> Result<ApiSettings, String> {
@@ -2309,14 +2420,7 @@ fn write_benchmark_results(
             directory.display()
         )
     })?;
-    let encoded = serde_json::to_string_pretty(results)
-        .map_err(|err| format!("failed to encode benchmark results: {err}"))?;
-    fs::write(&path, encoded).map_err(|err| {
-        format!(
-            "failed to write benchmark results {}: {err}",
-            path.display()
-        )
-    })
+    write_json_file(&path, results, "benchmark results")
 }
 
 fn benchmark_prompt() -> &'static str {
@@ -2372,10 +2476,7 @@ fn write_knowledge_store(app_handle: &AppHandle, store: &KnowledgeStore) -> Resu
             directory.display()
         )
     })?;
-    let encoded = serde_json::to_string_pretty(store)
-        .map_err(|err| format!("failed to encode knowledge store: {err}"))?;
-    fs::write(&path, encoded)
-        .map_err(|err| format!("failed to write knowledge store {}: {err}", path.display()))
+    write_json_file(&path, store, "knowledge store")
 }
 
 fn ensure_default_knowledge_base(store: &mut KnowledgeStore) {
@@ -2624,10 +2725,7 @@ fn seed_default_profiles(directory: &Path) -> Result<(), String> {
 
     for profile in default_profiles() {
         let path = directory.join(format!("{}.{}", profile.id, PROFILE_EXTENSION));
-        let encoded = serde_json::to_string_pretty(&profile)
-            .map_err(|err| format!("failed to encode default profile {}: {err}", profile.id))?;
-        fs::write(&path, encoded)
-            .map_err(|err| format!("failed to seed profile {}: {err}", path.display()))?;
+        write_json_file(&path, &profile, &format!("default profile {}", profile.id))?;
     }
 
     Ok(())
@@ -4906,6 +5004,40 @@ mod tests {
             port: 0,
         })
         .is_err());
+    }
+
+    #[test]
+    fn atomic_write_text_replaces_existing_file_and_cleans_sidecars() {
+        let directory = env::temp_dir().join(format!(
+            "kivarro-atomic-write-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default()
+        ));
+        fs::create_dir_all(&directory).expect("create atomic write test directory");
+        let path = directory.join("settings.json");
+        fs::write(&path, "old").expect("write initial settings");
+
+        atomic_write_text(&path, "new", "test settings").expect("replace settings atomically");
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("read replaced settings"),
+            "new"
+        );
+        let sidecars = fs::read_dir(&directory)
+            .expect("read atomic write test directory")
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| name.starts_with(".settings.json."))
+            .collect::<Vec<_>>();
+        assert!(
+            sidecars.is_empty(),
+            "unexpected sidecar files: {sidecars:?}"
+        );
+
+        fs::remove_dir_all(directory).expect("remove atomic write test directory");
     }
 
     #[test]
