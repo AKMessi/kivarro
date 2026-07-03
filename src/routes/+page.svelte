@@ -138,6 +138,7 @@
   let selectedModelId = "";
   let modelFilter = "";
   let logFilter = "ALL";
+  let logSearch = "";
   let profileSaveStatus = "Synced";
   let engineBusy = false;
   let engineNotice = "";
@@ -212,8 +213,9 @@
       .toLowerCase()
       .includes(modelFilter.toLowerCase()),
   );
-  $: filteredLogs =
-    logFilter === "ALL" ? logs : logs.filter((entry) => entry.level.toUpperCase() === logFilter);
+  $: filteredLogs = logs.filter(
+    (entry) => (logFilter === "ALL" || entry.level.toUpperCase() === logFilter) && matchesLogSearch(entry),
+  );
   $: activeKnowledgeBase =
     knowledgeBases.find((base) => base.id === selectedKnowledgeBaseId) ?? knowledgeBases[0] ?? null;
   $: configuredBaseUrl = apiStatus?.baseUrl ?? `http://${apiSettings.host}:${apiSettings.port}/v1`;
@@ -718,6 +720,17 @@
     return "Local engine command failed.";
   }
 
+  function matchesLogSearch(entry: LogEntry) {
+    const query = logSearch.trim();
+    if (!query) return true;
+    const haystack = `${entry.timestamp} ${entry.level} ${entry.source} ${entry.message}`;
+    try {
+      return new RegExp(query, "i").test(haystack);
+    } catch {
+      return haystack.toLowerCase().includes(query.toLowerCase());
+    }
+  }
+
   function addSystemMessage(label: string, content: string) {
     chatMessages = [
       ...chatMessages,
@@ -930,7 +943,12 @@
     </div>
   </header>
 
-  <div class="shell" class:left-collapsed={leftCollapsed} class:right-collapsed={rightCollapsed}>
+  <div
+    class="shell"
+    class:left-collapsed={leftCollapsed}
+    class:right-collapsed={rightCollapsed}
+    class:wide-workspace={activeView === "logs"}
+  >
     <nav class="nav-rail" aria-label="Primary navigation">
       <div class="rail-stack">
         {#each navItems as item}
@@ -1687,7 +1705,7 @@
           </button>
         </section>
 
-        <section class="api-dashboard">
+        <section class:online={apiStatus?.enabled} class="api-dashboard">
           <div class="api-config-grid">
             <label>
               <span>Host</span>
@@ -1735,6 +1753,13 @@
               </div>
             {/each}
           </div>
+          <pre class="curl-block">{`curl ${configuredBaseUrl}/chat/completions \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "model": "${engineStatus?.activeModelName ?? "local-model"}",
+    "messages": [{ "role": "user", "content": "ping" }],
+    "stream": true
+  }'`}</pre>
         </section>
       {:else if activeView === "benchmarks"}
         <section class="workspace-header">
@@ -1746,6 +1771,25 @@
             <Gauge size={15} />
             {benchmarkBusy ? "Benchmarking" : "Run benchmark"}
           </button>
+        </section>
+
+        <section class="benchmark-metrics">
+          <article>
+            <span>Gen eval/s</span>
+            <strong>{formatNumber(benchmarks[0]?.tokensPerSecond ?? 0)}</strong>
+          </article>
+          <article>
+            <span>Total tokens</span>
+            <strong>{formatTokens(benchmarks[0]?.evalCount ?? 0)}</strong>
+          </article>
+          <article>
+            <span>Load time</span>
+            <strong>{formatNumber((benchmarks[0]?.loadDurationMs ?? 0) / 1000)}s</strong>
+          </article>
+          <article>
+            <span>Runs</span>
+            <strong>{formatTokens(benchmarks.length)}</strong>
+          </article>
         </section>
 
         {#if benchmarks.length === 0}
@@ -1772,6 +1816,14 @@
           <div>
             <p class="eyebrow">System Logs</p>
             <h1>Runtime event stream</h1>
+          </div>
+          <div class="log-toolbar">
+            <div class="filter-row inline-filter">
+              {#each ["ALL", "INFO", "WARN", "ERROR", "DEBUG"] as level}
+                <button class:active={logFilter === level} onclick={() => (logFilter = level)}>{level}</button>
+              {/each}
+            </div>
+            <input aria-label="Search logs" placeholder="Regex search..." bind:value={logSearch} />
           </div>
         </section>
 
@@ -3484,6 +3536,19 @@
     grid-template-columns: 48px 0 minmax(0, 1fr) 0;
   }
 
+  .shell.wide-workspace,
+  .shell.wide-workspace.left-collapsed,
+  .shell.wide-workspace.right-collapsed,
+  .shell.wide-workspace.left-collapsed.right-collapsed {
+    grid-template-columns: 48px 0 minmax(0, 1fr) 0;
+  }
+
+  .shell.wide-workspace .context-panel,
+  .shell.wide-workspace .inspector {
+    border: 0;
+    pointer-events: none;
+  }
+
   .nav-rail,
   .context-panel,
   .inspector {
@@ -3962,6 +4027,133 @@
     background: var(--bg-elevated);
   }
 
+  .log-toolbar {
+    width: min(640px, 52vw);
+    display: grid;
+    grid-template-columns: auto minmax(180px, 1fr);
+    align-items: center;
+    gap: 8px;
+  }
+
+  .inline-filter {
+    margin: 0;
+    display: flex;
+    gap: 4px;
+  }
+
+  .inline-filter button {
+    height: 28px;
+    padding: 0 9px;
+    border-radius: var(--radius-sm);
+  }
+
+  .log-toolbar input {
+    height: 28px;
+  }
+
+  .api-dashboard {
+    width: min(800px, calc(100% - 28px));
+    justify-self: center;
+    margin: 14px auto;
+  }
+
+  .api-dashboard::before {
+    content: "";
+    width: 10px;
+    height: 10px;
+    display: inline-block;
+    margin-right: 8px;
+    border-radius: var(--radius-pill);
+    background: var(--accent-danger);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-danger) 14%, transparent);
+  }
+
+  .api-dashboard.online::before {
+    background: var(--accent-primary);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-primary) 14%, transparent);
+  }
+
+  .curl-block {
+    min-height: 128px;
+    max-width: 100%;
+    overflow: auto;
+    color: var(--text-secondary);
+    white-space: pre;
+  }
+
+  .benchmark-metrics {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 10px;
+    padding: 14px;
+  }
+
+  .benchmark-metrics article {
+    display: grid;
+    gap: 6px;
+    padding: 12px;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-md);
+    background: var(--bg-panel);
+  }
+
+  .benchmark-metrics span {
+    color: var(--text-tertiary);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+  }
+
+  .benchmark-metrics strong {
+    color: var(--text-primary);
+    font-family: var(--font-mono);
+    font-size: 18px;
+  }
+
+  .rag-grid,
+  .knowledge-workbench {
+    padding: 14px;
+  }
+
+  .rag-grid article {
+    min-height: 260px;
+    border-radius: var(--radius-md);
+  }
+
+  .agent-canvas {
+    background-image: radial-gradient(color-mix(in srgb, var(--text-tertiary) 28%, transparent) 1px, transparent 1px);
+    background-size: 18px 18px;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-md);
+    margin: 14px;
+    padding: 14px;
+  }
+
+  .agent-node {
+    position: relative;
+  }
+
+  .agent-node::before,
+  .agent-node::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    width: 8px;
+    height: 8px;
+    border: 1px solid var(--accent-info);
+    border-radius: var(--radius-pill);
+    background: var(--bg-panel);
+  }
+
+  .agent-node::before {
+    left: -5px;
+  }
+
+  .agent-node::after {
+    right: -5px;
+  }
+
   @media (max-width: 1200px) {
     .shell {
       grid-template-columns: 48px 240px minmax(0, 1fr) 0;
@@ -3982,6 +4174,12 @@
     .allocation-grid,
     .runtime-grid {
       grid-template-columns: 1fr;
+    }
+
+    .log-toolbar,
+    .benchmark-metrics {
+      grid-template-columns: 1fr;
+      width: 100%;
     }
 
     .tuning-grid,
