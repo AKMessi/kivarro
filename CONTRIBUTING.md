@@ -15,9 +15,7 @@ Install and verify:
 
 ```bash
 npm install
-npm run check
-npm run build
-cargo check --manifest-path src-tauri/Cargo.toml
+npm run check:all
 ```
 
 Run the desktop app:
@@ -39,6 +37,7 @@ Before opening a PR:
 - Run `npm run check`.
 - Run `npm run build`.
 - Run `cargo check --manifest-path src-tauri/Cargo.toml`.
+- Run `cargo test --manifest-path src-tauri/Cargo.toml`.
 - Do not commit local model files, generated installers, private logs, or `.env` files.
 - Keep UI changes aligned with the instrument-panel design system in `src/app.css` and `src/routes/+page.svelte`.
 - Keep Tauri/Rust IPC behavior backward compatible unless the PR explicitly documents a breaking change.

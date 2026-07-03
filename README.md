@@ -39,8 +39,7 @@ The license text is from the PolyForm Project: <https://polyformproject.org/lice
 
 ```bash
 npm install
-npm run check
-npm run build
+npm run check:all
 npm run tauri dev
 ```
 
@@ -53,9 +52,7 @@ npm run dev -- --host 127.0.0.1 --port 4173
 ## Verification
 
 ```bash
-npm run check
-cargo check --manifest-path src-tauri/Cargo.toml
-npm run build
+npm run check:all
 npm run tauri build
 ```
 
@@ -123,6 +120,7 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Security-
 - `npm run check`
 - `npm run build`
 - `cargo check --manifest-path src-tauri/Cargo.toml`
+- `cargo test --manifest-path src-tauri/Cargo.toml`
 - `npm run tauri build`
 - Confirm no local model files or generated bundles are staged.
 - Confirm package, Cargo, README, and license metadata all match `PolyForm-Noncommercial-1.0.0`.

@@ -7,6 +7,7 @@
 - [ ] `npm run check`
 - [ ] `npm run build`
 - [ ] `cargo check --manifest-path src-tauri/Cargo.toml`
+- [ ] `cargo test --manifest-path src-tauri/Cargo.toml`
 
 ## Risk
 
