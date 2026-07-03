@@ -16,6 +16,7 @@ Kivarro is a Rust/Tauri local model inference workstation for Windows, macOS, an
 - Persisted Local API host/port configuration with status-bar synchronization and copyable OpenAI-compatible base URL.
 - Tokens/sec benchmark runner for the loaded model, persisted under the app config directory with eval count, eval duration, tokens/sec, and load duration.
 - Local RAG knowledge bases with persisted document metadata, UTF-8 text/Markdown/source ingestion, deterministic chunking, and retrieval test ranking.
+- Persisted System Logs for profile saves, model imports, engine lifecycle events, API endpoint changes, benchmark runs, and knowledge-base updates.
 - Browser-preview fallbacks for UI smoke testing outside Tauri.
 - Windows ARM64 release bundling verified with MSI and NSIS outputs.
 

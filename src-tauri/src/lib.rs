@@ -24,6 +24,8 @@ const PROFILE_EXTENSION: &str = "kivarro.json";
 const API_SETTINGS_FILE: &str = "api-settings.json";
 const BENCHMARK_RESULTS_FILE: &str = "benchmarks.json";
 const MAX_BENCHMARK_RESULTS: usize = 200;
+const SYSTEM_LOG_FILE: &str = "system-logs.json";
+const MAX_SYSTEM_LOGS: usize = 1_000;
 const KNOWLEDGE_STORE_FILE: &str = "knowledge-store.json";
 const MAX_KNOWLEDGE_DOCUMENT_BYTES: u64 = 8 * 1024 * 1024;
 const KNOWLEDGE_CHUNK_TARGET_CHARS: usize = 1_200;
@@ -353,7 +355,7 @@ struct RetrievalMatch {
     snippet: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct LogEntry {
     level: String,
@@ -944,7 +946,7 @@ fn list_models() -> Result<Vec<ModelRecord>, String> {
 }
 
 #[tauri::command]
-fn import_model_file(path: String) -> Result<ModelImportResult, String> {
+fn import_model_file(app_handle: AppHandle, path: String) -> Result<ModelImportResult, String> {
     let raw_path = path.trim();
     if raw_path.is_empty() {
         return Err("model file path is required".to_string());
@@ -989,6 +991,12 @@ fn import_model_file(path: String) -> Result<ModelImportResult, String> {
 
     let imported = model_record_from_path(&destination)?;
     let models = list_models()?;
+    let _ = append_system_log(
+        &app_handle,
+        "INFO",
+        "registry",
+        format!("Imported model {}", imported.name),
+    );
 
     Ok(ModelImportResult { imported, models })
 }
@@ -1053,6 +1061,13 @@ fn save_inference_profile(
 
     fs::write(&path, encoded)
         .map_err(|err| format!("failed to write profile {}: {err}", path.display()))?;
+
+    let _ = append_system_log(
+        &app_handle,
+        "INFO",
+        "profiles",
+        format!("Saved inference profile {}", profile.name),
+    );
 
     Ok(profile)
 }
@@ -1309,16 +1324,23 @@ fn start_engine_for_backend(
     guard.child = Some(child);
     guard.active_backend = backend.to_string();
     guard.active_model_id = Some(canonical_model_id);
-    guard.active_model_name = Some(model_name);
+    guard.active_model_name = Some(model_name.clone());
     guard.active_request_model = Some(request_model);
     guard.load_started_at = Some(Instant::now());
-    guard.host = host;
+    guard.host = host.clone();
     guard.port = port;
     guard.last_error = None;
     guard.last_tokens_per_second = 0.0;
     guard.last_load_duration_ms = 0;
     guard.context_used_tokens = 0;
     guard.context_total_tokens = profile.runtime.context_length;
+
+    let _ = append_system_log(
+        app_handle,
+        "INFO",
+        "engine",
+        format!("Started {backend} for {model_name} on {host}:{port}"),
+    );
 
     Ok(engine_status_from_guard(&mut guard, Some(binary_path)))
 }
@@ -1346,6 +1368,13 @@ fn stop_inference_engine(
     guard.host = settings.host;
     guard.port = settings.port;
     let backend = guard.active_backend.clone();
+
+    let _ = append_system_log(
+        &app_handle,
+        "INFO",
+        "engine",
+        format!("Stopped {backend} engine"),
+    );
 
     Ok(engine_status_from_guard(
         &mut guard,
@@ -1735,6 +1764,15 @@ fn save_api_settings(
     }
 
     write_api_settings(&app_handle, &settings)?;
+    let _ = append_system_log(
+        &app_handle,
+        "INFO",
+        "api",
+        format!(
+            "Saved local API endpoint {}:{}",
+            settings.host, settings.port
+        ),
+    );
     get_api_status(app_handle, engine)
 }
 
@@ -1837,6 +1875,17 @@ fn run_benchmark(
     );
     results.truncate(MAX_BENCHMARK_RESULTS);
     write_benchmark_results(&app_handle, &results)?;
+    if let Some(result) = results.first() {
+        let _ = append_system_log(
+            &app_handle,
+            "INFO",
+            "benchmarks",
+            format!(
+                "Recorded benchmark for {} at {:.1} tok/s",
+                result.model, result.tokens_per_second
+            ),
+        );
+    }
 
     Ok(results)
 }
@@ -1871,6 +1920,12 @@ fn create_knowledge_base(
     });
     sort_knowledge_bases(&mut store);
     write_knowledge_store(&app_handle, &store)?;
+    let _ = append_system_log(
+        &app_handle,
+        "INFO",
+        "knowledge",
+        format!("Created knowledge base {name}"),
+    );
 
     Ok(store.bases)
 }
@@ -1925,6 +1980,7 @@ fn import_knowledge_document(
     if chunks.is_empty() {
         return Err("document did not contain indexable text".to_string());
     }
+    let chunk_count = chunks.len();
 
     let document_name = document_path
         .file_name()
@@ -1961,7 +2017,7 @@ fn import_knowledge_document(
         name: document_name.clone(),
         path: document_path_string,
         size_bytes: metadata.len(),
-        chunk_count: chunks.len() as u32,
+        chunk_count: chunk_count as u32,
         imported_at,
     });
     for (index, content) in chunks.into_iter().enumerate() {
@@ -1977,6 +2033,12 @@ fn import_knowledge_document(
     refresh_knowledge_base_counts(&mut store, &knowledge_base_id);
     sort_knowledge_bases(&mut store);
     write_knowledge_store(&app_handle, &store)?;
+    let _ = append_system_log(
+        &app_handle,
+        "INFO",
+        "knowledge",
+        format!("Imported document {document_name} into {chunk_count} chunks"),
+    );
 
     knowledge_base_detail(&store, &knowledge_base_id)
 }
@@ -2005,28 +2067,14 @@ fn test_knowledge_retrieval(
 }
 
 #[tauri::command]
-fn list_system_logs() -> Result<Vec<LogEntry>, String> {
-    Ok(vec![
-        LogEntry {
-            level: "INFO".to_string(),
-            source: "core".to_string(),
-            message: "Kivarro desktop shell initialized".to_string(),
-            timestamp: "local session".to_string(),
-        },
-        LogEntry {
-            level: "INFO".to_string(),
-            source: "registry".to_string(),
-            message: "Model discovery scans the local ./models directory in this baseline"
-                .to_string(),
-            timestamp: "local session".to_string(),
-        },
-        LogEntry {
-            level: "WARN".to_string(),
-            source: "accelerator".to_string(),
-            message: "GPU telemetry is reserved for the hardware adapter layer".to_string(),
-            timestamp: "local session".to_string(),
-        },
-    ])
+fn list_system_logs(app_handle: AppHandle) -> Result<Vec<LogEntry>, String> {
+    let mut logs = read_system_logs(&app_handle)?;
+    if logs.is_empty() {
+        logs = seeded_system_logs();
+        write_system_logs(&app_handle, &logs)?;
+    }
+
+    Ok(logs)
 }
 
 fn profile_directory(app_handle: &AppHandle) -> Result<PathBuf, String> {
@@ -2035,6 +2083,98 @@ fn profile_directory(app_handle: &AppHandle) -> Result<PathBuf, String> {
         .app_config_dir()
         .map(|path| path.join("profiles"))
         .map_err(|err| format!("failed to resolve app profile directory: {err}"))
+}
+
+fn system_logs_path(app_handle: &AppHandle) -> Result<PathBuf, String> {
+    app_handle
+        .path()
+        .app_config_dir()
+        .map(|path| path.join(SYSTEM_LOG_FILE))
+        .map_err(|err| format!("failed to resolve system log path: {err}"))
+}
+
+fn read_system_logs(app_handle: &AppHandle) -> Result<Vec<LogEntry>, String> {
+    let path = system_logs_path(app_handle)?;
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let raw = fs::read_to_string(&path)
+        .map_err(|err| format!("failed to read system logs {}: {err}", path.display()))?;
+    if raw.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut logs = serde_json::from_str::<Vec<LogEntry>>(&raw)
+        .map_err(|err| format!("failed to parse system logs {}: {err}", path.display()))?;
+    logs.truncate(MAX_SYSTEM_LOGS);
+
+    Ok(logs)
+}
+
+fn write_system_logs(app_handle: &AppHandle, logs: &[LogEntry]) -> Result<(), String> {
+    let path = system_logs_path(app_handle)?;
+    let Some(directory) = path.parent() else {
+        return Err("system log path has no parent directory".to_string());
+    };
+    fs::create_dir_all(directory).map_err(|err| {
+        format!(
+            "failed to create system log directory {}: {err}",
+            directory.display()
+        )
+    })?;
+    let encoded = serde_json::to_string_pretty(logs)
+        .map_err(|err| format!("failed to encode system logs: {err}"))?;
+    fs::write(&path, encoded)
+        .map_err(|err| format!("failed to write system logs {}: {err}", path.display()))
+}
+
+fn append_system_log(
+    app_handle: &AppHandle,
+    level: &str,
+    source: &str,
+    message: impl Into<String>,
+) -> Result<(), String> {
+    let mut logs = read_system_logs(app_handle)?;
+    if logs.is_empty() {
+        logs = seeded_system_logs();
+    }
+    logs.insert(
+        0,
+        LogEntry {
+            level: level.to_ascii_uppercase(),
+            source: source.to_string(),
+            message: message.into(),
+            timestamp: unix_timestamp().to_string(),
+        },
+    );
+    logs.truncate(MAX_SYSTEM_LOGS);
+    write_system_logs(app_handle, &logs)
+}
+
+fn seeded_system_logs() -> Vec<LogEntry> {
+    vec![
+        LogEntry {
+            level: "INFO".to_string(),
+            source: "core".to_string(),
+            message: "Kivarro desktop shell initialized".to_string(),
+            timestamp: unix_timestamp().to_string(),
+        },
+        LogEntry {
+            level: "INFO".to_string(),
+            source: "registry".to_string(),
+            message: "Model discovery scans and imports local model files under ./models"
+                .to_string(),
+            timestamp: unix_timestamp().to_string(),
+        },
+        LogEntry {
+            level: "INFO".to_string(),
+            source: "api".to_string(),
+            message: "Local API endpoint settings are persisted in the app config directory"
+                .to_string(),
+            timestamp: unix_timestamp().to_string(),
+        },
+    ]
 }
 
 fn api_settings_path(app_handle: &AppHandle) -> Result<PathBuf, String> {

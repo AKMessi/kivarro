@@ -321,6 +321,10 @@
     engineNotice = nextEngineStatus.message;
   }
 
+  async function refreshLogs() {
+    logs = await listSystemLogs();
+  }
+
   function setActiveView(view: ViewId) {
     activeView = view;
     commandPaletteOpen = false;
@@ -353,6 +357,7 @@
       modelImportPath = "";
       modelFilter = "";
       await updateLoadPlan();
+      await refreshLogs();
       addSystemMessage("Model Registry", `Imported ${result.imported.name}`);
     } catch (error) {
       addSystemMessage("Model Registry", errorMessage(error));
@@ -381,6 +386,7 @@
         : [];
       retrievalResults = [];
       newKnowledgeBaseName = "";
+      await refreshLogs();
     } catch (error) {
       addSystemMessage("Knowledge", errorMessage(error));
     } finally {
@@ -407,6 +413,7 @@
     selectedProfileId = savedProfile.id;
     profileSaveStatus = "Saved";
     void updateLoadPlan(savedProfile);
+    void refreshLogs();
   }
 
   function toggleTheme() {
@@ -428,6 +435,7 @@
       const [nextMetrics, nextApiStatus] = await Promise.all([getRuntimeMetrics(), getApiStatus()]);
       metrics = nextMetrics;
       apiStatus = nextApiStatus;
+      await refreshLogs();
     } catch (error) {
       engineNotice = errorMessage(error);
       addSystemMessage("Engine", engineNotice);
@@ -444,6 +452,7 @@
       const [nextMetrics, nextApiStatus] = await Promise.all([getRuntimeMetrics(), getApiStatus()]);
       metrics = nextMetrics;
       apiStatus = nextApiStatus;
+      await refreshLogs();
     } catch (error) {
       engineNotice = errorMessage(error);
       addSystemMessage("Engine", engineNotice);
@@ -471,6 +480,7 @@
       engineStatus = nextEngineStatus;
       engineNotice = nextEngineStatus.message;
       apiCopyStatus = "Saved";
+      await refreshLogs();
     } catch (error) {
       addSystemMessage("API", errorMessage(error));
       apiCopyStatus = "Save failed";
@@ -503,6 +513,7 @@
       selectedKnowledgeBaseId = detail.base.id;
       retrievalResults = [];
       knowledgeImportPath = "";
+      await refreshLogs();
     } catch (error) {
       addSystemMessage("Knowledge", errorMessage(error));
     } finally {
@@ -544,6 +555,7 @@
       ]);
       metrics = nextMetrics;
       engineStatus = nextEngineStatus;
+      await refreshLogs();
     } catch (error) {
       addSystemMessage("Benchmark", errorMessage(error));
     } finally {
