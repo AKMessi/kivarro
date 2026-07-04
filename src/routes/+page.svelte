@@ -41,6 +41,7 @@
     cancelChatCompletionStream,
     fallbackProfiles,
     createKnowledgeBase,
+    formatApiBaseUrl,
     getApiSettings,
     getApiStatus,
     getEngineStatus,
@@ -249,7 +250,7 @@
   $: activeKnowledgeDocument =
     knowledgeDocuments.find((document) => document.id === selectedKnowledgeDocumentId) ?? knowledgeDocuments[0] ?? null;
   $: ragChunkRows = buildRagChunkRows(activeKnowledgeDocument, retrievalResults);
-  $: configuredBaseUrl = apiStatus?.baseUrl ?? `http://${apiSettings.host}:${apiSettings.port}/v1`;
+  $: configuredBaseUrl = apiStatus?.baseUrl ?? formatApiBaseUrl(apiSettings);
   $: profilePreviewJson = JSON.stringify(buildProfileFromControls(), null, 2);
   $: engineOnline = engineStatus?.state === "ready";
   $: engineLoading = engineStatus?.state === "loading";
@@ -564,16 +565,23 @@
   }
 
   async function saveCurrentProfile() {
+    if (profileSaveStatus === "Saving") return;
+
     profileSaveStatus = "Saving";
-    const savedProfile = await saveInferenceProfile(buildProfileFromControls());
-    profiles = [
-      savedProfile,
-      ...profiles.filter((profile) => profile.id !== savedProfile.id),
-    ].sort((left, right) => left.name.localeCompare(right.name));
-    selectedProfileId = savedProfile.id;
-    profileSaveStatus = "Saved";
-    void updateLoadPlan(savedProfile);
-    void refreshLogs();
+    try {
+      const savedProfile = await saveInferenceProfile(buildProfileFromControls());
+      profiles = [
+        savedProfile,
+        ...profiles.filter((profile) => profile.id !== savedProfile.id),
+      ].sort((left, right) => left.name.localeCompare(right.name));
+      selectedProfileId = savedProfile.id;
+      profileSaveStatus = "Saved";
+      void updateLoadPlan(savedProfile);
+      void refreshLogs();
+    } catch (error) {
+      profileSaveStatus = "Save failed";
+      addSystemMessage("Profiles", errorMessage(error));
+    }
   }
 
   function toggleTheme() {
@@ -2661,6 +2669,7 @@
 
   .wordmark {
     color: var(--amber);
+    font-family: var(--font-display);
     font-weight: 800;
     letter-spacing: 0.08em;
     text-transform: uppercase;
@@ -3070,6 +3079,7 @@
 
   .workspace-header h1 {
     margin: 2px 0 0;
+    font-family: var(--font-display);
     font-size: 22px;
     line-height: 1.1;
     letter-spacing: 0;
@@ -4149,7 +4159,7 @@
 
   .wordmark {
     color: var(--text-primary);
-    font-family: var(--font-mono);
+    font-family: var(--font-display);
     font-size: 12px;
     font-weight: 800;
     letter-spacing: 0.2em;
@@ -4354,6 +4364,7 @@
   .workspace-header h1 {
     margin: 0;
     color: var(--text-primary);
+    font-family: var(--font-display);
     font-size: var(--text-xl);
     font-weight: 650;
     letter-spacing: 0;

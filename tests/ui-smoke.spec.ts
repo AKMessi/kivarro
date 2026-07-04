@@ -89,6 +89,23 @@ test("keeps titlebar controls clickable outside the drag region", async ({ page 
   expect(errors).toEqual([]);
 });
 
+test("uses the app font stack and formats preview API URLs", async ({ page }) => {
+  const errors = failOnBrowserErrors(page);
+  await page.goto("/");
+
+  const fontFamily = await page.locator("body").evaluate((node) => getComputedStyle(node).fontFamily);
+  expect(fontFamily).toContain("Aptos");
+  expect(fontFamily).toContain("Segoe UI Variable");
+
+  await page.getByRole("button", { name: "Local API" }).click();
+  await page.getByLabel("API host").fill("::1");
+  await page.getByLabel("API port").fill("8081");
+  await page.getByRole("button", { name: "Save endpoint" }).click();
+
+  await expect(page.locator(".api-status-strip code")).toHaveText("http://[::1]:8081/v1");
+  expect(errors).toEqual([]);
+});
+
 test("fits the minimum desktop window without horizontal overflow", async ({ page }) => {
   const errors = failOnBrowserErrors(page);
   await page.setViewportSize({ width: 900, height: 720 });

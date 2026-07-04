@@ -337,6 +337,18 @@ async function invokeOrPreview<T>(
   return invoke<T>(command, args);
 }
 
+export function formatApiBaseUrl(settings: ApiSettings): string {
+  return `http://${formatHttpHost(settings.host.trim())}:${Number(settings.port)}/v1`;
+}
+
+function formatHttpHost(host: string): string {
+  if (host.startsWith("[") && host.endsWith("]")) {
+    return host;
+  }
+
+  return host.includes(":") ? `[${host}]` : host;
+}
+
 export function getHardwareSnapshot(): Promise<HardwareSnapshot> {
   return safeInvoke("get_hardware_snapshot", fallbackHardware);
 }
@@ -376,11 +388,11 @@ export function listInferenceProfiles(): Promise<InferenceProfile[]> {
 }
 
 export function saveInferenceProfile(profile: InferenceProfile): Promise<InferenceProfile> {
-  return safeInvoke("save_inference_profile", profile, { profile });
+  return invokeOrPreview("save_inference_profile", profile, { profile });
 }
 
 export function deleteInferenceProfile(id: string): Promise<void> {
-  return safeInvoke("delete_inference_profile", undefined, { id });
+  return invokeOrPreview<void>("delete_inference_profile", undefined, { id });
 }
 
 export function getModelLoadPlan(
@@ -404,7 +416,7 @@ export function saveApiSettings(settings: ApiSettings): Promise<ApiStatus> {
     {
       ...fallbackApiStatus,
       port: settings.port,
-      baseUrl: `http://${settings.host}:${settings.port}/v1`,
+      baseUrl: formatApiBaseUrl(settings),
     },
     { settings },
   );
