@@ -831,6 +831,35 @@
     await getTauriWindow()?.close().catch(() => undefined);
   }
 
+  async function startWindowDrag(event: PointerEvent) {
+    if (event.button !== 0 || titlebarTargetIsInteractive(event.target)) {
+      return;
+    }
+
+    await getTauriWindow()?.startDragging().catch(() => undefined);
+  }
+
+  function titlebarTargetIsInteractive(target: EventTarget | null) {
+    return (
+      target instanceof Element &&
+      Boolean(target.closest("[data-no-window-drag], button, input, select, textarea, a, [role='button']"))
+    );
+  }
+
+  function windowDragRegion(node: HTMLElement) {
+    const handlePointerDown = (event: PointerEvent) => {
+      void startWindowDrag(event);
+    };
+
+    node.addEventListener("pointerdown", handlePointerDown);
+
+    return {
+      destroy() {
+        node.removeEventListener("pointerdown", handlePointerDown);
+      }
+    };
+  }
+
   function getTauriWindow() {
     if (!isTauriRuntime()) {
       return null;
@@ -1121,8 +1150,8 @@
 </svelte:head>
 
 <div class="app">
-  <header class="titlebar" data-tauri-drag-region>
-    <div class="title-identity" data-tauri-drag-region>
+  <header class="titlebar" use:windowDragRegion>
+    <div class="title-identity">
       <span class="brand-lockup">
         <BrainCircuit size={16} strokeWidth={1.8} />
         <span class="wordmark">Kivarro</span>
@@ -1134,14 +1163,14 @@
       </span>
     </div>
 
-    <button class="title-command" data-tauri-drag-region="false" onclick={toggleCommandPalette}>
+    <button class="title-command" data-no-window-drag onclick={toggleCommandPalette}>
       <Search size={13} />
       <span>Command / action</span>
       <code>Ctrl K</code>
     </button>
 
-    <div class="title-actions" data-tauri-drag-region>
-      <div class="quick-actions" data-tauri-drag-region="false">
+    <div class="title-actions">
+      <div class="quick-actions" data-no-window-drag>
         <button class="icon-button" aria-label="Toggle left panel" title="Toggle left panel" onclick={() => (leftCollapsed = !leftCollapsed)}>
           <PanelLeftClose size={16} />
         </button>
@@ -1159,7 +1188,7 @@
           <PanelRightClose size={16} />
         </button>
       </div>
-      <div class="window-controls" data-tauri-drag-region="false">
+      <div class="window-controls" data-no-window-drag>
         <button aria-label="Minimize window" class="window-control minimize" onclick={minimizeWindow}>
           <Minus size={12} />
         </button>
@@ -4061,6 +4090,8 @@
   .quick-actions {
     gap: 4px;
     padding: 0;
+    position: relative;
+    z-index: 2;
   }
 
   .title-actions {
@@ -4078,6 +4109,8 @@
     border-radius: var(--radius-sm);
     color: var(--text-secondary);
     background: transparent;
+    position: relative;
+    z-index: 3;
   }
 
   .window-control.close,
@@ -4161,6 +4194,8 @@
     justify-self: center;
     width: min(600px, 100%);
     height: 28px;
+    position: relative;
+    z-index: 2;
     display: grid;
     grid-template-columns: 18px minmax(0, 1fr) auto;
     align-items: center;

@@ -53,6 +53,8 @@ test("opens and closes the keyboard command palette", async ({ page }) => {
   const errors = failOnBrowserErrors(page);
   await page.goto("/");
 
+  await expect(page.getByLabel("Prompt input")).toBeVisible();
+  await page.getByLabel("Prompt input").focus();
   await page.keyboard.press("Control+K");
   await expect(page.getByLabel("Command palette search")).toBeVisible();
 
@@ -61,6 +63,28 @@ test("opens and closes the keyboard command palette", async ({ page }) => {
 
   await page.keyboard.press("Escape");
   await expect(page.getByLabel("Command palette search")).toBeHidden();
+
+  expect(errors).toEqual([]);
+});
+
+test("keeps titlebar controls clickable outside the drag region", async ({ page }) => {
+  const errors = failOnBrowserErrors(page);
+  await page.goto("/");
+
+  await expect(page.locator(".titlebar")).not.toHaveAttribute("data-tauri-drag-region", /.*/);
+  await expect(page.locator(".title-identity")).not.toHaveAttribute("data-tauri-drag-region", /.*/);
+  await expect(page.locator(".title-actions")).not.toHaveAttribute("data-tauri-drag-region", /.*/);
+  await expect(page.locator(".title-command")).not.toHaveAttribute("data-tauri-drag-region", /.*/);
+  await expect(page.locator(".quick-actions")).not.toHaveAttribute("data-tauri-drag-region", /.*/);
+  await expect(page.locator(".window-controls")).not.toHaveAttribute("data-tauri-drag-region", /.*/);
+
+  await page.getByRole("button", { name: "Command palette" }).click();
+  await expect(page.getByLabel("Command palette search")).toBeVisible();
+  await page.keyboard.press("Escape");
+
+  await page.getByRole("button", { name: "Minimize window" }).click();
+  await page.getByRole("button", { name: "Maximize window" }).click();
+  await page.getByRole("button", { name: "Close window" }).click();
 
   expect(errors).toEqual([]);
 });
