@@ -218,8 +218,9 @@
   $: activeProfile =
     profiles.find((profile) => profile.id === selectedProfileId) ?? profiles[0] ?? fallbackProfiles[0];
   $: selectedModel = models.find((model) => model.id === selectedModelId) ?? models[0] ?? null;
+  $: displayedContextTotal = metrics?.contextTotalTokens || sampling.contextLength;
   $: contextPercent = metrics
-    ? clamp((metrics.contextUsedTokens / metrics.contextTotalTokens) * 100, 0, 100)
+    ? clamp((metrics.contextUsedTokens / Math.max(displayedContextTotal, 1)) * 100, 0, 100)
     : 0;
   $: ramPercent = metrics ? clamp((metrics.ramUsedGib / Math.max(metrics.ramTotalGib, 1)) * 100, 0, 100) : 0;
   $: filteredModels = models.filter((model) =>
@@ -1303,7 +1304,7 @@
       </span>
       <span class="title-model">
         <span>{metrics?.activeModel ?? selectedModel?.name ?? "No model loaded"}</span>
-        <code>{formatTokens(metrics?.contextUsedTokens ?? 0)} / {formatTokens(metrics?.contextTotalTokens ?? sampling.contextLength)} ctx</code>
+        <code>{formatTokens(metrics?.contextUsedTokens ?? 0)} / {formatTokens(displayedContextTotal)} ctx</code>
         <i class="title-context-meter"><b style={`width: ${contextPercent}%`}></b></i>
       </span>
     </div>
@@ -2649,7 +2650,7 @@
         <div class="section-label">Context Window</div>
         <div class="context-readout">
           <strong>{formatTokens(metrics?.contextUsedTokens ?? 0)}</strong>
-          <span>/ {formatTokens(metrics?.contextTotalTokens ?? sampling.contextLength)} tokens</span>
+          <span>/ {formatTokens(displayedContextTotal)} tokens</span>
         </div>
         <div class="mini-bar"><span style={`width: ${contextPercent}%`}></span></div>
       </section>

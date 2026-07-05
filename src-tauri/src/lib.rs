@@ -31,6 +31,15 @@ const MAX_KNOWLEDGE_DOCUMENT_BYTES: u64 = 8 * 1024 * 1024;
 const KNOWLEDGE_CHUNK_TARGET_CHARS: usize = 1_200;
 const KNOWLEDGE_CHUNK_OVERLAP_CHARS: usize = 160;
 const MAX_RETRIEVAL_RESULTS: usize = 8;
+const LLAMA_LOW_RAM_CONTEXT_LIMIT: u32 = 32_768;
+const LLAMA_MID_RAM_CONTEXT_LIMIT: u32 = 65_536;
+const LLAMA_HIGH_RAM_CONTEXT_LIMIT: u32 = 131_072;
+const LLAMA_LOW_RAM_BATCH_LIMIT: u32 = 512;
+const LLAMA_MID_RAM_BATCH_LIMIT: u32 = 1024;
+const LLAMA_HIGH_RAM_BATCH_LIMIT: u32 = 2048;
+const LLAMA_LOW_RAM_UBATCH_LIMIT: u32 = 128;
+const LLAMA_MID_RAM_UBATCH_LIMIT: u32 = 256;
+const LLAMA_HIGH_RAM_UBATCH_LIMIT: u32 = 512;
 const GGUF_MAGIC: &[u8; 4] = b"GGUF";
 const GGUF_VALUE_TYPE_ARRAY: u32 = 9;
 const GGUF_VALUE_TYPE_STRING: u32 = 8;
@@ -1098,6 +1107,7 @@ fn get_model_load_plan(
     profile: InferenceProfile,
 ) -> Result<ModelLoadPlan, String> {
     validate_profile(&profile)?;
+    let backend = profile_backend(&profile)?;
 
     let model_path = PathBuf::from(&model_id);
     if !model_path.exists() {
@@ -1142,24 +1152,26 @@ fn get_model_load_plan(
     let block_count = gguf_metadata
         .as_ref()
         .and_then(|summary| summary.block_count);
+    let ram_total_gib = system_ram_total_gib();
+    let (planned_profile, stability_adjustments) =
+        stabilize_profile_for_launch(&profile, backend, model_context_length, ram_total_gib);
     let metadata_source = gguf_metadata
         .as_ref()
         .map(|summary| format!("GGUF v{}", summary.version))
         .unwrap_or_else(|| "filename".to_string());
     let estimated_layers = estimate_layer_count(&model_name, block_count);
-    let gpu_layers = profile.runtime.gpu_layers.min(estimated_layers);
+    let gpu_layers = planned_profile.runtime.gpu_layers.min(estimated_layers);
     let cpu_layers = estimated_layers.saturating_sub(gpu_layers);
     let kv_cache_gib = estimate_kv_cache_gib(
-        profile.runtime.context_length,
+        planned_profile.runtime.context_length,
         estimated_layers,
-        &profile.runtime.kv_cache_quantization,
+        &planned_profile.runtime.kv_cache_quantization,
     );
     let runtime_overhead_gib = round_gib((model_weights_gib * 0.08).max(0.6));
     let total_required_gib = round_gib(model_weights_gib + kv_cache_gib + runtime_overhead_gib);
 
     let mut system = System::new_all();
     system.refresh_memory();
-    let ram_total_gib = bytes_to_gib(system.total_memory());
     let ram_used_gib = bytes_to_gib(system.used_memory());
     let ram_available_gib = (ram_total_gib - ram_used_gib).max(0.0);
     let fit = if total_required_gib <= ram_available_gib {
@@ -1171,7 +1183,12 @@ fn get_model_load_plan(
     }
     .to_string();
 
-    let recommendation = if let Some(model_context_length) = model_context_length
+    let recommendation = if !stability_adjustments.is_empty() {
+        format!(
+            "Kivarro will apply a stable llama.cpp launch plan: {}.",
+            stability_adjustments.join("; ")
+        )
+    } else if let Some(model_context_length) = model_context_length
         .filter(|context_length| profile.runtime.context_length > *context_length)
     {
         format!(
@@ -1192,7 +1209,7 @@ fn get_model_load_plan(
     Ok(ModelLoadPlan {
         model_id,
         profile_id: profile.id,
-        backend: profile.runtime.backend,
+        backend: planned_profile.runtime.backend,
         fit,
         recommendation,
         model_name,
@@ -1285,12 +1302,21 @@ fn start_engine_for_backend(
     let binary_path =
         find_engine_binary(backend).ok_or_else(|| engine_binary_missing_message(backend))?;
     let model_name = model_display_name_from_path(&model_path);
+    let model_context_length = read_model_gguf_metadata(&model_path)
+        .as_ref()
+        .and_then(|summary| summary.context_length);
+    let (launch_profile, stability_adjustments) = stabilize_profile_for_launch(
+        &profile,
+        backend,
+        model_context_length,
+        system_ram_total_gib(),
+    );
     let request_model = request_model_name(backend, &model_name);
     let api_settings = read_api_settings(app_handle)?;
     let port = api_settings.port;
     let host = api_settings.host;
-    let args = build_engine_args(backend, &model_path, &profile, &host, port);
-    let runtime_signature = engine_runtime_signature(&profile, backend);
+    let args = build_engine_args(backend, &model_path, &launch_profile, &host, port);
+    let runtime_signature = engine_runtime_signature(&launch_profile, backend);
 
     let mut guard = engine
         .inner
@@ -1350,14 +1376,17 @@ fn start_engine_for_backend(
     guard.last_tokens_per_second = 0.0;
     guard.last_load_duration_ms = 0;
     guard.context_used_tokens = 0;
-    guard.context_total_tokens = profile.runtime.context_length;
+    guard.context_total_tokens = launch_profile.runtime.context_length;
 
-    let _ = append_system_log(
-        app_handle,
-        "INFO",
-        "engine",
-        format!("Started {backend} for {model_name} on {host}:{port}"),
-    );
+    let log_message = if stability_adjustments.is_empty() {
+        format!("Started {backend} for {model_name} on {host}:{port}")
+    } else {
+        format!(
+            "Started {backend} for {model_name} on {host}:{port} with stable launch plan: {}",
+            stability_adjustments.join("; ")
+        )
+    };
+    let _ = append_system_log(app_handle, "INFO", "engine", log_message);
 
     Ok(engine_status_from_guard(&mut guard, Some(binary_path)))
 }
@@ -1383,6 +1412,7 @@ fn stop_inference_engine(
     guard.last_error = None;
     guard.last_tokens_per_second = 0.0;
     guard.context_used_tokens = 0;
+    guard.context_total_tokens = 0;
     guard.host = settings.host;
     guard.port = settings.port;
     let backend = guard.active_backend.clone();
@@ -1525,12 +1555,12 @@ fn run_chat_completion_inner(
             .inner
             .lock()
             .map_err(|_| "engine state lock is poisoned".to_string())?;
+        let context_total_tokens = guard.context_total_tokens;
         guard.last_tokens_per_second = tokens_per_second;
         guard.context_used_tokens = total_tokens.unwrap_or_else(|| {
             (prompt_tokens.unwrap_or_default() + completion_tokens.unwrap_or_default())
-                .min(profile.runtime.context_length)
+                .min(context_total_tokens)
         });
-        guard.context_total_tokens = profile.runtime.context_length;
         guard.active_model_id = Some(active_context.active_model_id);
         guard.active_model_name = Some(active_context.active_model_name.clone());
         guard.last_error = None;
@@ -1725,9 +1755,9 @@ fn run_chat_completion_stream(
             .inner
             .lock()
             .map_err(|_| "engine state lock is poisoned".to_string())?;
+        let context_total_tokens = guard.context_total_tokens;
         guard.last_tokens_per_second = tokens_per_second;
-        guard.context_used_tokens = completion_tokens.min(profile.runtime.context_length);
-        guard.context_total_tokens = profile.runtime.context_length;
+        guard.context_used_tokens = completion_tokens.min(context_total_tokens);
         guard.active_model_id = Some(active_context.active_model_id.clone());
         guard.active_model_name = Some(active_context.active_model_name.clone());
         guard.last_error = None;
@@ -2916,9 +2946,9 @@ fn default_profiles() -> Vec<InferenceProfile> {
             },
             runtime: RuntimeParameters {
                 backend: "llama.cpp".to_string(),
-                context_length: 65536,
-                batch_size: 1024,
-                micro_batch_size: 256,
+                context_length: 32768,
+                batch_size: 512,
+                micro_batch_size: 128,
                 cpu_threads: default_thread_count(),
                 gpu_layers: 0,
                 tensor_split: Vec::new(),
@@ -2935,8 +2965,8 @@ fn default_profiles() -> Vec<InferenceProfile> {
                 json_schema: String::new(),
                 grammar: String::new(),
                 logit_bias: Vec::new(),
-                logprobs: true,
-                top_logprobs: 5,
+                logprobs: false,
+                top_logprobs: 0,
             },
             created_at: "built-in".to_string(),
             updated_at: "built-in".to_string(),
@@ -2968,9 +2998,9 @@ fn default_profiles() -> Vec<InferenceProfile> {
             },
             runtime: RuntimeParameters {
                 backend: "llama.cpp".to_string(),
-                context_length: 131072,
-                batch_size: 1024,
-                micro_batch_size: 256,
+                context_length: 65536,
+                batch_size: 512,
+                micro_batch_size: 128,
                 cpu_threads: default_thread_count(),
                 gpu_layers: 0,
                 tensor_split: Vec::new(),
@@ -3265,6 +3295,7 @@ fn refresh_engine_process(guard: &mut ManagedEngine) {
             guard.load_started_at = None;
             guard.last_tokens_per_second = 0.0;
             guard.context_used_tokens = 0;
+            guard.context_total_tokens = 0;
             guard.last_error = Some(engine_exit_message(
                 engine_process_label(&guard.active_backend),
                 &status,
@@ -3277,6 +3308,7 @@ fn refresh_engine_process(guard: &mut ManagedEngine) {
             guard.load_started_at = None;
             guard.last_tokens_per_second = 0.0;
             guard.context_used_tokens = 0;
+            guard.context_total_tokens = 0;
             guard.last_error = Some(format!(
                 "failed to inspect {} process: {err}",
                 engine_process_label(&guard.active_backend)
@@ -3565,6 +3597,86 @@ fn build_engine_args(
     }
 }
 
+fn stabilize_profile_for_launch(
+    profile: &InferenceProfile,
+    backend: &str,
+    model_context_length: Option<u32>,
+    ram_total_gib: f64,
+) -> (InferenceProfile, Vec<String>) {
+    let mut profile = profile.clone();
+    let mut adjustments = Vec::new();
+    if canonical_backend(backend).unwrap_or(BACKEND_LLAMA_CPP) != BACKEND_LLAMA_CPP {
+        return (profile, adjustments);
+    }
+
+    let (context_limit, batch_limit, micro_batch_limit) = llama_stability_limits(ram_total_gib);
+    let mut effective_context = profile.runtime.context_length.min(context_limit);
+    if let Some(model_context_length) = model_context_length {
+        effective_context = effective_context.min(model_context_length);
+    }
+    effective_context = effective_context.max(512);
+
+    if effective_context != profile.runtime.context_length {
+        adjustments.push(format!(
+            "context {} -> {} tokens",
+            profile.runtime.context_length, effective_context
+        ));
+        profile.runtime.context_length = effective_context;
+    }
+
+    let effective_batch = profile
+        .runtime
+        .batch_size
+        .min(batch_limit)
+        .min(profile.runtime.context_length)
+        .max(1);
+    if effective_batch != profile.runtime.batch_size {
+        adjustments.push(format!(
+            "batch {} -> {}",
+            profile.runtime.batch_size, effective_batch
+        ));
+        profile.runtime.batch_size = effective_batch;
+    }
+
+    let effective_micro_batch = profile
+        .runtime
+        .micro_batch_size
+        .min(micro_batch_limit)
+        .min(profile.runtime.batch_size)
+        .max(1);
+    if effective_micro_batch != profile.runtime.micro_batch_size {
+        adjustments.push(format!(
+            "micro-batch {} -> {}",
+            profile.runtime.micro_batch_size, effective_micro_batch
+        ));
+        profile.runtime.micro_batch_size = effective_micro_batch;
+    }
+
+    (profile, adjustments)
+}
+
+fn llama_stability_limits(ram_total_gib: f64) -> (u32, u32, u32) {
+    if ram_total_gib < 24.0 {
+        (
+            LLAMA_LOW_RAM_CONTEXT_LIMIT,
+            LLAMA_LOW_RAM_BATCH_LIMIT,
+            LLAMA_LOW_RAM_UBATCH_LIMIT,
+        )
+    } else if ram_total_gib < 48.0 {
+        (
+            LLAMA_MID_RAM_CONTEXT_LIMIT,
+            LLAMA_MID_RAM_BATCH_LIMIT,
+            LLAMA_MID_RAM_UBATCH_LIMIT,
+        )
+    } else {
+        (
+            LLAMA_HIGH_RAM_CONTEXT_LIMIT,
+            LLAMA_HIGH_RAM_BATCH_LIMIT,
+            LLAMA_HIGH_RAM_UBATCH_LIMIT,
+        )
+    }
+}
+
 fn engine_runtime_signature(profile: &InferenceProfile, backend: &str) -> String {
     let backend = canonical_backend(backend).unwrap_or(BACKEND_LLAMA_CPP);
     if backend == BACKEND_MISTRAL_RS {
@@ -3723,7 +3835,7 @@ fn build_chat_completion_payload(
         payload.insert("stop".to_string(), json!(profile.sampling.stop_sequences));
     }
 
-    if profile.output.logprobs {
+    if supports_logprob_request_options(backend) && profile.output.logprobs {
         payload.insert("logprobs".to_string(), json!(true));
         payload.insert(
             "top_logprobs".to_string(),
@@ -3766,6 +3878,13 @@ fn build_chat_completion_payload(
 }
 
 fn supports_structured_request_options(backend: &str) -> bool {
+    !matches!(
+        canonical_backend(backend).unwrap_or(BACKEND_LLAMA_CPP),
+        BACKEND_LLAMA_CPP
+    )
+}
+
+fn supports_logprob_request_options(backend: &str) -> bool {
     !matches!(
         canonical_backend(backend).unwrap_or(BACKEND_LLAMA_CPP),
         BACKEND_LLAMA_CPP
@@ -5042,6 +5161,12 @@ fn bytes_to_gib(bytes: u64) -> f64 {
     round_gib(gib)
 }
 
+fn system_ram_total_gib() -> f64 {
+    let mut system = System::new_all();
+    system.refresh_memory();
+    bytes_to_gib(system.total_memory())
+}
+
 fn round_gib(gib: f64) -> f64 {
     (gib * 10.0).round() / 10.0
 }
@@ -5219,6 +5344,50 @@ mod tests {
     }
 
     #[test]
+    fn stabilizes_llama_launch_profiles_for_low_ram_systems() {
+        let mut profile = default_profiles()
+            .into_iter()
+            .find(|profile| profile.id == "long-context-analyst")
+            .expect("long context profile");
+        profile.runtime.context_length = 131_072;
+        profile.runtime.batch_size = 2048;
+        profile.runtime.micro_batch_size = 512;
+
+        let (stable_profile, adjustments) =
+            stabilize_profile_for_launch(&profile, BACKEND_LLAMA_CPP, Some(128_000), 16.0);
+
+        assert_eq!(
+            stable_profile.runtime.context_length,
+            LLAMA_LOW_RAM_CONTEXT_LIMIT
+        );
+        assert_eq!(stable_profile.runtime.batch_size, LLAMA_LOW_RAM_BATCH_LIMIT);
+        assert_eq!(
+            stable_profile.runtime.micro_batch_size,
+            LLAMA_LOW_RAM_UBATCH_LIMIT
+        );
+        assert!(!adjustments.is_empty());
+    }
+
+    #[test]
+    fn keeps_non_llama_launch_profiles_unmodified() {
+        let mut profile = default_profiles()
+            .into_iter()
+            .find(|profile| profile.id == "long-context-analyst")
+            .expect("long context profile");
+        profile.runtime.context_length = 131_072;
+        profile.runtime.batch_size = 2048;
+        profile.runtime.micro_batch_size = 512;
+
+        let (stable_profile, adjustments) =
+            stabilize_profile_for_launch(&profile, BACKEND_MISTRAL_RS, Some(128_000), 16.0);
+
+        assert_eq!(stable_profile.runtime.context_length, 131_072);
+        assert_eq!(stable_profile.runtime.batch_size, 2048);
+        assert_eq!(stable_profile.runtime.micro_batch_size, 512);
+        assert!(adjustments.is_empty());
+    }
+
+    #[test]
     fn mistral_runtime_signature_matches_serve_args_surface() {
         let mut profile = default_profiles()
             .into_iter()
@@ -5278,6 +5447,46 @@ mod tests {
         assert_eq!(
             payload.pointer("/grammar").and_then(Value::as_str),
             Some("root ::= \"ok\"")
+        );
+    }
+
+    #[test]
+    fn omits_logprobs_for_llama_cpp_payloads() {
+        let mut profile = default_profiles()
+            .into_iter()
+            .find(|profile| profile.id == "local-code-reviewer")
+            .expect("code reviewer profile");
+        profile.output.logprobs = true;
+        profile.output.top_logprobs = 5;
+
+        let payload =
+            build_chat_completion_payload(&profile, BACKEND_LLAMA_CPP, "local-model", "hello", &[])
+                .expect("llama.cpp chat payload");
+
+        assert!(payload.get("logprobs").is_none());
+        assert!(payload.get("top_logprobs").is_none());
+    }
+
+    #[test]
+    fn keeps_logprobs_for_non_llama_payloads() {
+        let mut profile = default_profiles()
+            .into_iter()
+            .find(|profile| profile.id == "local-code-reviewer")
+            .expect("code reviewer profile");
+        profile.output.logprobs = true;
+        profile.output.top_logprobs = 5;
+
+        let payload =
+            build_chat_completion_payload(&profile, BACKEND_MISTRAL_RS, "default", "hello", &[])
+                .expect("mistral.rs chat payload");
+
+        assert_eq!(
+            payload.pointer("/logprobs").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            payload.pointer("/top_logprobs").and_then(Value::as_u64),
+            Some(5)
         );
     }
 
