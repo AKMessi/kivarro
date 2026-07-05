@@ -1,6 +1,6 @@
 # Contributing to Kivarro
 
-Kivarro is a source-available, non-commercial local inference workstation. Contributions are welcome for non-commercial use under the PolyForm Noncommercial License 1.0.0.
+Kivarro is an open-source local inference workstation. Contributions are welcome under the MIT License.
 
 ## Development Setup
 
@@ -51,4 +51,4 @@ Do not upload model binaries, prompts, documents, logs, or screenshots containin
 
 ## Licensing
 
-By contributing, you agree that your contribution is licensed under the same license as the project: PolyForm Noncommercial License 1.0.0.
+By contributing, you agree that your contribution is licensed under the same license as the project: MIT.

@@ -1,0 +1,111 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build, for example v0.1.0-alpha"
+        required: true
+        default: "v0.1.0-alpha"
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x64
+            os: ubuntu-22.04
+            args: ""
+          - label: linux-arm64
+            os: ubuntu-22.04-arm
+            args: ""
+          - label: macos-apple-silicon
+            os: macos-latest
+            args: "--target aarch64-apple-darwin"
+          - label: macos-intel
+            os: macos-latest
+            args: "--target x86_64-apple-darwin"
+          - label: windows-x64
+            os: windows-latest
+            args: ""
+          - label: windows-arm64
+            os: windows-11-arm
+            args: ""
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: release
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Linux Tauri dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            xdg-utils
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build and upload Tauri bundles
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ steps.release.outputs.tag }}
+          releaseName: "Kivarro ${{ steps.release.outputs.tag }}"
+          releaseBody: |
+            Kivarro local model inference workstation alpha release.
+
+            Downloads:
+            - Windows x64: use the Windows setup executable or MSI.
+            - Windows ARM64: use the ARM64 setup executable or MSI.
+            - macOS: use the DMG for your architecture.
+            - Linux: use the AppImage, Debian package, or RPM produced by the Linux build.
+
+            Notes:
+            - This is an unsigned alpha build. Windows SmartScreen and macOS Gatekeeper may warn on first launch.
+            - Kivarro supervises local backends such as llama.cpp `llama-server`; install a backend separately and point Kivarro at it if it is not on PATH.
+            - Do not attach private prompts, documents, model files, or unsanitized logs to public issues.
+          releaseDraft: false
+          prerelease: true
+          args: ${{ matrix.args }}

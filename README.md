@@ -2,7 +2,22 @@
 
 Kivarro is a Rust/Tauri local model inference workstation for Windows, macOS, and Linux. It is built for running, tuning, inspecting, and serving private local AI models from a desktop cockpit UI.
 
-> License note: Kivarro is source-available for non-commercial use under the PolyForm Noncommercial License 1.0.0. This is not an OSI open-source license because commercial use is restricted.
+Kivarro is open source under the MIT License.
+
+## Downloads
+
+Download the latest alpha build from [GitHub Releases](https://github.com/AKMessi/kivarro/releases).
+
+Release assets are built by GitHub Actions for:
+
+- Windows x64
+- Windows ARM64
+- macOS Apple Silicon
+- macOS Intel
+- Linux x64
+- Linux ARM64
+
+These alpha builds are unsigned. Windows SmartScreen and macOS Gatekeeper may warn on first launch.
 
 ## Status
 
@@ -24,9 +39,7 @@ Kivarro is a Rust/Tauri local model inference workstation for Windows, macOS, an
 
 ## License
 
-Kivarro is licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE). You may use, modify, and distribute it for permitted non-commercial purposes. For commercial use, contact the repository owner.
-
-The license text is from the PolyForm Project: <https://polyformproject.org/licenses/noncommercial/1.0.0>.
+Kivarro is licensed under the [MIT License](LICENSE).
 
 ## Prerequisites
 
@@ -121,5 +134,7 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Security-
 - `npm run check:all`
 - `npm run test:ui`
 - `npm run tauri build`
+- Push a `v*` tag to trigger `.github/workflows/release.yml`.
+- Confirm GitHub Releases contains Windows x64, Windows ARM64, macOS, and Linux assets.
 - Confirm no local model files or generated bundles are staged.
-- Confirm package, Cargo, README, and license metadata all match `PolyForm-Noncommercial-1.0.0`.
+- Confirm package, Cargo, README, and license metadata all match `MIT`.
