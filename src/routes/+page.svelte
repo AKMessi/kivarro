@@ -142,6 +142,9 @@
     { name: "MCP registry", enabled: false, danger: false },
   ];
 
+  const ENGINE_READY_WAIT_MS = 30_000;
+  const ENGINE_READY_POLL_MS = 500;
+
   let activeView: ViewId = "command";
   let theme: "dark" | "light" = "dark";
   let leftCollapsed = false;
@@ -182,6 +185,7 @@
   let apiStatus: ApiStatus | null = null;
   let apiSettings: ApiSettings = { host: "127.0.0.1", port: 8080 };
   let engineStatus: EngineStatus | null = null;
+  let preparedEngineProfileKey = "";
   let benchmarks: BenchmarkResult[] = [];
   let logs: LogEntry[] = [];
   let knowledgeBases: KnowledgeBase[] = [];
@@ -336,6 +340,7 @@
     apiStatus = nextApiStatus;
     apiSettings = nextApiSettings;
     engineStatus = nextEngineStatus;
+    syncPreparedEngineProfile(nextEngineStatus);
     engineNotice = nextEngineStatus.message;
     benchmarks = nextBenchmarks;
     knowledgeBases = nextKnowledgeBases;
@@ -355,6 +360,7 @@
     ]);
     metrics = nextMetrics;
     engineStatus = nextEngineStatus;
+    syncPreparedEngineProfile(nextEngineStatus);
     apiStatus = nextApiStatus;
     engineNotice = nextEngineStatus.message;
   }
@@ -491,12 +497,17 @@
 
     selectedProfileId = profile.id;
     sampling = controlsFromProfile(profile);
+    preparedEngineProfileKey = "";
     profileSaveStatus = "Loaded";
+    if (engineOnline) {
+      engineNotice = `${profile.name} selected. The next request will prepare this profile automatically.`;
+    }
     void updateLoadPlan(profile);
   }
 
   function selectModel(modelId: string) {
     selectedModelId = modelId;
+    preparedEngineProfileKey = "";
     void updateLoadPlan();
   }
 
@@ -575,6 +586,7 @@
         ...profiles.filter((profile) => profile.id !== savedProfile.id),
       ].sort((left, right) => left.name.localeCompare(right.name));
       selectedProfileId = savedProfile.id;
+      preparedEngineProfileKey = "";
       profileSaveStatus = "Saved";
       void updateLoadPlan(savedProfile);
       void refreshLogs();
@@ -588,6 +600,125 @@
     theme = theme === "dark" ? "light" : "dark";
   }
 
+  function profileExecutionKey(profile: InferenceProfile) {
+    return JSON.stringify({
+      id: profile.id,
+      systemPrompt: profile.systemPrompt,
+      sampling: profile.sampling,
+      runtime: profile.runtime,
+      output: profile.output,
+    });
+  }
+
+  function isEngineReadyForModel(status: EngineStatus | null, modelId: string) {
+    return status?.state === "ready" && status.activeModelId === modelId;
+  }
+
+  function syncPreparedEngineProfile(status: EngineStatus | null = engineStatus) {
+    if (!isEngineReadyForModel(status, selectedModelId)) {
+      preparedEngineProfileKey = "";
+    }
+  }
+
+  function delay(ms: number) {
+    return new Promise((resolve) => window.setTimeout(resolve, ms));
+  }
+
+  async function waitForEngineReady(modelId: string, profileKey: string) {
+    const deadline = Date.now() + ENGINE_READY_WAIT_MS;
+
+    while (Date.now() <= deadline) {
+      const status = await getEngineStatus();
+      engineStatus = status;
+      engineNotice = status.message;
+
+      if (isEngineReadyForModel(status, modelId)) {
+        preparedEngineProfileKey = profileKey;
+        return true;
+      }
+
+      if (status.state === "error" || status.state === "offline" || status.state === "unconfigured") {
+        preparedEngineProfileKey = "";
+        return false;
+      }
+
+      await delay(ENGINE_READY_POLL_MS);
+    }
+
+    preparedEngineProfileKey = "";
+    return false;
+  }
+
+  async function refreshEngineSidecars() {
+    const [nextMetrics, nextApiStatus] = await Promise.all([getRuntimeMetrics(), getApiStatus()]);
+    metrics = nextMetrics;
+    apiStatus = nextApiStatus;
+    await refreshLogs();
+  }
+
+  async function prepareEngineForProfile(profile: InferenceProfile, modelId: string, modelName: string) {
+    if (!modelId) {
+      addSystemMessage("Engine", "Select a local model before sending a prompt.");
+      return false;
+    }
+
+    const profileKey = profileExecutionKey(profile);
+    if (isEngineReadyForModel(engineStatus, modelId) && preparedEngineProfileKey === profileKey) {
+      try {
+        const status = await getEngineStatus();
+        engineStatus = status;
+        engineNotice = status.message;
+        syncPreparedEngineProfile(status);
+        if (isEngineReadyForModel(status, modelId) && preparedEngineProfileKey === profileKey) {
+          return true;
+        }
+      } catch {
+        preparedEngineProfileKey = "";
+      }
+    }
+
+    if (engineBusy) {
+      addSystemMessage("Engine", "The engine is already preparing a model. Wait for Ready before sending again.");
+      return false;
+    }
+
+    engineBusy = true;
+    engineNotice = isEngineReadyForModel(engineStatus, modelId)
+      ? `Applying ${profile.name} to ${modelName}`
+      : `Loading ${modelName} with ${profile.name}`;
+
+    try {
+      engineStatus = await startInferenceEngine(modelId, profile);
+      engineNotice = engineStatus.message;
+
+      if (isEngineReadyForModel(engineStatus, modelId)) {
+        preparedEngineProfileKey = profileKey;
+        await refreshEngineSidecars();
+        return true;
+      }
+
+      const ready = await waitForEngineReady(modelId, profileKey);
+      await refreshEngineSidecars().catch(() => undefined);
+      if (ready) {
+        return true;
+      }
+
+      addSystemMessage(
+        "Engine",
+        `${engineStatus?.message ?? "Model is still loading."} Kivarro will use ${profile.name} after the model reaches Ready.`,
+      );
+      return false;
+    } catch (error) {
+      preparedEngineProfileKey = "";
+      engineNotice = errorMessage(error);
+      addSystemMessage("Engine", engineNotice);
+      await refreshLogs().catch(() => undefined);
+      return false;
+    } finally {
+      engineBusy = false;
+    }
+  }
+
   async function startSelectedModel() {
     if (!selectedModelId || !selectedModel) {
       engineNotice = "Select a local model before loading.";
@@ -595,49 +726,23 @@
     }
 
     const profile = buildProfileFromControls();
-    engineBusy = true;
-    engineNotice = `Starting ${profile.runtime.backend} for ${selectedModel.name}`;
-    try {
-      engineStatus = await startInferenceEngine(selectedModelId, profile);
-      engineNotice = engineStatus.message;
-      const [nextMetrics, nextApiStatus] = await Promise.all([getRuntimeMetrics(), getApiStatus()]);
-      metrics = nextMetrics;
-      apiStatus = nextApiStatus;
-      await refreshLogs();
-    } catch (error) {
-      engineNotice = errorMessage(error);
-      addSystemMessage("Engine", engineNotice);
-    } finally {
-      engineBusy = false;
-    }
+    await prepareEngineForProfile(profile, selectedModelId, selectedModel.name);
   }
 
   async function loadModelFromRegistry(model: ModelRecord) {
     selectedModelId = model.id;
+    preparedEngineProfileKey = "";
     await updateLoadPlan();
 
     const profile = buildProfileFromControls();
-    engineBusy = true;
-    engineNotice = `Starting ${profile.runtime.backend} for ${model.name}`;
-    try {
-      engineStatus = await startInferenceEngine(model.id, profile);
-      engineNotice = engineStatus.message;
-      const [nextMetrics, nextApiStatus] = await Promise.all([getRuntimeMetrics(), getApiStatus()]);
-      metrics = nextMetrics;
-      apiStatus = nextApiStatus;
-      await refreshLogs();
-    } catch (error) {
-      engineNotice = errorMessage(error);
-      addSystemMessage("Engine", engineNotice);
-    } finally {
-      engineBusy = false;
-    }
+    await prepareEngineForProfile(profile, model.id, model.name);
   }
 
   async function stopEngine() {
     engineBusy = true;
     try {
       engineStatus = await stopInferenceEngine();
+      preparedEngineProfileKey = "";
       engineNotice = engineStatus.message;
       const [nextMetrics, nextApiStatus] = await Promise.all([getRuntimeMetrics(), getApiStatus()]);
       metrics = nextMetrics;
@@ -732,20 +837,21 @@
       activeView = "models";
       return;
     }
-    if (!engineOnline) {
-      addSystemMessage("Benchmark", "Load the selected model before running a benchmark.");
+    const profile = buildProfileFromControls();
+    if (!(await prepareEngineForProfile(profile, selectedModelId, selectedModel.name))) {
       return;
     }
 
     benchmarkBusy = true;
     try {
-      benchmarks = await runBenchmark(selectedModelId, buildProfileFromControls());
+      benchmarks = await runBenchmark(selectedModelId, profile);
       const [nextMetrics, nextEngineStatus] = await Promise.all([
         getRuntimeMetrics(),
         getEngineStatus(),
       ]);
       metrics = nextMetrics;
       engineStatus = nextEngineStatus;
+      syncPreparedEngineProfile(nextEngineStatus);
       await refreshLogs();
     } catch (error) {
       addSystemMessage("Benchmark", errorMessage(error));
@@ -761,13 +867,8 @@
       addSystemMessage("Engine", "Select and load a model before sending a prompt.");
       return;
     }
-    if (!engineOnline) {
-      addSystemMessage(
-        "Engine",
-        engineStatus?.state === "error"
-          ? `${engineStatus.message} Click Load model to restart.`
-          : "Load the selected model before sending a prompt.",
-      );
+    const profile = buildProfileFromControls();
+    if (!(await prepareEngineForProfile(profile, selectedModelId, selectedModel?.name ?? "selected model"))) {
       return;
     }
     const requestId = createId("assistant");
@@ -809,7 +910,7 @@
       const result = await runChatCompletionStream(
         requestId,
         selectedModelId,
-        buildProfileFromControls(),
+        profile,
         prompt,
         history,
       );
@@ -821,6 +922,7 @@
       ]);
       metrics = nextMetrics;
       engineStatus = nextEngineStatus;
+      syncPreparedEngineProfile(nextEngineStatus);
       apiStatus = nextApiStatus;
     } catch (error) {
       const message = errorMessage(error);

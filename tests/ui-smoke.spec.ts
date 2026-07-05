@@ -67,6 +67,24 @@ test("opens and closes the keyboard command palette", async ({ page }) => {
   expect(errors).toEqual([]);
 });
 
+test("switches prompt profiles directly", async ({ page }) => {
+  const errors = failOnBrowserErrors(page);
+  await page.goto("/");
+
+  const profileSelect = page.getByLabel("Prompt profile").first();
+  await expect(profileSelect).toBeVisible();
+
+  await profileSelect.selectOption("strict-json-extractor");
+  await expect(profileSelect).toHaveValue("strict-json-extractor");
+  await expect(page.getByText("Low-temperature extraction profile with JSON schema constraints ready.")).toBeVisible();
+
+  await profileSelect.selectOption("balanced-engineer");
+  await expect(profileSelect).toHaveValue("balanced-engineer");
+  await expect(page.getByText("General technical work with stable sampling and long-context defaults.")).toBeVisible();
+
+  expect(errors).toEqual([]);
+});
+
 test("keeps titlebar controls clickable outside the drag region", async ({ page }) => {
   const errors = failOnBrowserErrors(page);
   await page.goto("/");

@@ -459,6 +459,7 @@ struct ManagedEngine {
     active_model_id: Option<String>,
     active_model_name: Option<String>,
     active_request_model: Option<String>,
+    active_runtime_signature: Option<String>,
     load_started_at: Option<Instant>,
     last_load_duration_ms: u64,
     host: String,
@@ -486,6 +487,7 @@ impl Default for ManagedEngine {
             active_model_id: None,
             active_model_name: None,
             active_request_model: None,
+            active_runtime_signature: None,
             load_started_at: None,
             last_load_duration_ms: 0,
             host: DEFAULT_API_HOST.to_string(),
@@ -1288,6 +1290,7 @@ fn start_engine_for_backend(
     let port = api_settings.port;
     let host = api_settings.host;
     let args = build_engine_args(backend, &model_path, &profile, &host, port);
+    let runtime_signature = engine_runtime_signature(&profile, backend);
 
     let mut guard = engine
         .inner
@@ -1298,12 +1301,23 @@ fn start_engine_for_backend(
     if guard.child.is_some()
         && guard.active_backend == backend
         && guard.active_model_id.as_deref() == Some(canonical_model_id.as_str())
+        && guard.active_runtime_signature.as_deref() == Some(runtime_signature.as_str())
+        && guard.host == host
+        && guard.port == port
     {
         guard.last_error = None;
         return Ok(engine_status_from_guard(&mut guard, Some(binary_path)));
     }
 
     stop_child(&mut guard)?;
+    guard.active_model_id = None;
+    guard.active_model_name = None;
+    guard.active_request_model = None;
+    guard.active_runtime_signature = None;
+    guard.load_started_at = None;
+    guard.last_load_duration_ms = 0;
+    guard.last_tokens_per_second = 0.0;
+    guard.context_used_tokens = 0;
 
     let mut command = ProcessCommand::new(&binary_path);
     command
@@ -1328,6 +1342,7 @@ fn start_engine_for_backend(
     guard.active_model_id = Some(canonical_model_id);
     guard.active_model_name = Some(model_name.clone());
     guard.active_request_model = Some(request_model);
+    guard.active_runtime_signature = Some(runtime_signature);
     guard.load_started_at = Some(Instant::now());
     guard.host = host.clone();
     guard.port = port;
@@ -1362,6 +1377,7 @@ fn stop_inference_engine(
     guard.active_model_id = None;
     guard.active_model_name = None;
     guard.active_request_model = None;
+    guard.active_runtime_signature = None;
     guard.load_started_at = None;
     guard.last_load_duration_ms = 0;
     guard.last_error = None;
@@ -3242,6 +3258,7 @@ fn refresh_engine_process(guard: &mut ManagedEngine) {
     match child.try_wait() {
         Ok(Some(status)) => {
             guard.child = None;
+            guard.active_runtime_signature = None;
             guard.load_started_at = None;
             guard.last_tokens_per_second = 0.0;
             guard.context_used_tokens = 0;
@@ -3253,6 +3270,7 @@ fn refresh_engine_process(guard: &mut ManagedEngine) {
         Ok(None) => {}
         Err(err) => {
             guard.child = None;
+            guard.active_runtime_signature = None;
             guard.load_started_at = None;
             guard.last_tokens_per_second = 0.0;
             guard.context_used_tokens = 0;
@@ -3266,7 +3284,7 @@ fn refresh_engine_process(guard: &mut ManagedEngine) {
 
 fn engine_exit_message(process_label: &str, status: &std::process::ExitStatus) -> String {
     format!(
-        "{process_label} exited with status {status}. Click Load model to restart. If it repeats, switch to a non-schema profile such as Balanced Engineer or lower context/max tokens."
+        "{process_label} exited with status {status}. Kivarro will restart it on the next load, benchmark, or prompt. If it repeats, switch to a lighter profile or lower context/max tokens."
     )
 }
 
@@ -3542,6 +3560,55 @@ fn build_engine_args(
         BACKEND_MISTRAL_RS => build_mistralrs_serve_args(model_path, host, port),
         _ => build_llama_server_args(model_path, profile, host, port),
     }
+}
+
+fn engine_runtime_signature(profile: &InferenceProfile, backend: &str) -> String {
+    let backend = canonical_backend(backend).unwrap_or(BACKEND_LLAMA_CPP);
+    if backend == BACKEND_MISTRAL_RS {
+        return format!("backend={BACKEND_MISTRAL_RS}");
+    }
+
+    let runtime = &profile.runtime;
+    let tensor_split = runtime
+        .tensor_split
+        .iter()
+        .map(|value| format_float_arg(*value))
+        .collect::<Vec<_>>()
+        .join(",");
+    let main_gpu = runtime
+        .main_gpu
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let rope_frequency_base = runtime
+        .rope_frequency_base
+        .map(format_float_arg)
+        .unwrap_or_else(|| "none".to_string());
+    let rope_frequency_scale = runtime
+        .rope_frequency_scale
+        .map(format_float_arg)
+        .unwrap_or_else(|| "none".to_string());
+
+    format!(
+        concat!(
+            "backend={};ctx={};batch={};ubatch={};threads={};gpu_layers={};",
+            "tensor_split={};main_gpu={};mmap={};mlock={};flash_attn={};",
+            "kv_cache={};rope_base={};rope_scale={}"
+        ),
+        backend,
+        runtime.context_length,
+        runtime.batch_size,
+        runtime.micro_batch_size,
+        runtime.cpu_threads,
+        runtime.gpu_layers,
+        tensor_split,
+        main_gpu,
+        runtime.use_mmap,
+        runtime.use_mlock,
+        runtime.flash_attention,
+        runtime.kv_cache_quantization,
+        rope_frequency_base,
+        rope_frequency_scale
+    )
 }
 
 fn build_mistralrs_serve_args(model_path: &Path, host: &str, port: u16) -> Vec<String> {
@@ -5090,6 +5157,59 @@ mod tests {
         assert_eq!(
             request_model_name(BACKEND_MISTRAL_RS, "Mistral Local"),
             "default"
+        );
+    }
+
+    #[test]
+    fn runtime_signature_changes_for_llama_launch_fields() {
+        let mut profile = default_profiles()
+            .into_iter()
+            .find(|profile| profile.id == "balanced-engineer")
+            .expect("balanced profile");
+        let baseline = engine_runtime_signature(&profile, BACKEND_LLAMA_CPP);
+
+        profile.runtime.context_length += 1024;
+        let changed_context = engine_runtime_signature(&profile, BACKEND_LLAMA_CPP);
+        assert_ne!(baseline, changed_context);
+
+        profile.runtime.context_length -= 1024;
+        profile.runtime.gpu_layers += 1;
+        let changed_gpu_layers = engine_runtime_signature(&profile, BACKEND_LLAMA_CPP);
+        assert_ne!(baseline, changed_gpu_layers);
+    }
+
+    #[test]
+    fn runtime_signature_ignores_request_only_fields() {
+        let mut profile = default_profiles()
+            .into_iter()
+            .find(|profile| profile.id == "balanced-engineer")
+            .expect("balanced profile");
+        let baseline = engine_runtime_signature(&profile, BACKEND_LLAMA_CPP);
+
+        profile.sampling.temperature = 0.01;
+        profile.output.mode = "json_schema".to_string();
+        profile.output.json_schema = r#"{"type":"object"}"#.to_string();
+
+        assert_eq!(
+            baseline,
+            engine_runtime_signature(&profile, BACKEND_LLAMA_CPP)
+        );
+    }
+
+    #[test]
+    fn mistral_runtime_signature_matches_serve_args_surface() {
+        let mut profile = default_profiles()
+            .into_iter()
+            .find(|profile| profile.id == "balanced-engineer")
+            .expect("balanced profile");
+        let baseline = engine_runtime_signature(&profile, BACKEND_MISTRAL_RS);
+
+        profile.runtime.context_length += 1024;
+        profile.runtime.gpu_layers += 1;
+
+        assert_eq!(
+            baseline,
+            engine_runtime_signature(&profile, BACKEND_MISTRAL_RS)
         );
     }
 
