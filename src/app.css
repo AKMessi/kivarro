@@ -1,13 +1,9 @@
 :root {
-  --font-ui:
-    Aptos, "Segoe UI Variable", "SF Pro Text", Inter, "Noto Sans", ui-sans-serif, system-ui,
-    -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-  --font-display:
-    "Aptos Display", Aptos, "Segoe UI Variable Display", "SF Pro Display", Inter, "Noto Sans",
-    ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   --font-mono:
     "JetBrains Mono", "Cascadia Code", "Fira Code", "SFMono-Regular", Consolas, "Liberation Mono",
     monospace;
+  --font-ui: var(--font-mono);
+  --font-display: var(--font-mono);
   font-family: var(--font-ui);
   font-synthesis: none;
   font-optical-sizing: auto;

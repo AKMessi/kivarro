@@ -94,8 +94,8 @@ test("uses the app font stack and formats preview API URLs", async ({ page }) =>
   await page.goto("/");
 
   const fontFamily = await page.locator("body").evaluate((node) => getComputedStyle(node).fontFamily);
-  expect(fontFamily).toContain("Aptos");
-  expect(fontFamily).toContain("Segoe UI Variable");
+  expect(fontFamily).toContain("JetBrains Mono");
+  expect(fontFamily).toContain("Cascadia Code");
 
   await page.getByRole("button", { name: "Local API" }).click();
   await page.getByLabel("API host").fill("::1");
