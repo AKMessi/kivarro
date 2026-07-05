@@ -624,7 +624,7 @@ fn parse_nvidia_smi_gpus(output: &str) -> Vec<ComputeBlock> {
         .lines()
         .enumerate()
         .filter_map(|(index, line)| {
-            let parts = line.split(',').map(str::trim).collect::<Vec<_>>();
+            let parts = parse_csv_line(line);
             if parts.len() < 4 || parts[0].is_empty() {
                 return None;
             }
