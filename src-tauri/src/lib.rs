@@ -3137,6 +3137,9 @@ fn active_engine_context(
     engine: &State<'_, EngineRuntime>,
     requested_model_id: &str,
 ) -> Result<ActiveEngineContext, String> {
+    let requested_model_id = canonical_model_path(requested_model_id)?
+        .to_string_lossy()
+        .to_string();
     let mut guard = engine
         .inner
         .lock()
@@ -5158,6 +5161,25 @@ mod tests {
             request_model_name(BACKEND_MISTRAL_RS, "Mistral Local"),
             "default"
         );
+    }
+
+    #[test]
+    fn canonical_model_path_normalizes_model_identity() {
+        let path = env::temp_dir().join(format!(
+            "kivarro-model-identity-{}-{}.gguf",
+            std::process::id(),
+            unix_timestamp()
+        ));
+        File::create(&path).expect("create synthetic model file");
+
+        let raw_path = path.to_string_lossy().to_string();
+        let canonical = canonical_model_path(&raw_path).expect("canonical model path");
+        let canonical_again =
+            canonical_model_path(&canonical.to_string_lossy()).expect("canonical model path again");
+
+        assert_eq!(canonical, canonical_again);
+
+        fs::remove_file(path).expect("remove synthetic model file");
     }
 
     #[test]

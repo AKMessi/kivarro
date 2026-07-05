@@ -610,8 +610,26 @@
     });
   }
 
+  function normalizeModelIdentity(value: string | null | undefined) {
+    if (!value) return "";
+
+    let normalized = value.trim().replace(/\\/g, "/");
+    normalized = normalized.replace(/^\/\/\?\/UNC\//i, "//");
+    normalized = normalized.replace(/^\/\/\?\//, "");
+
+    return /^[a-z]:\//i.test(normalized) || normalized.startsWith("//")
+      ? normalized.toLowerCase()
+      : normalized;
+  }
+
+  function modelIdsMatch(left: string | null | undefined, right: string | null | undefined) {
+    const normalizedLeft = normalizeModelIdentity(left);
+    const normalizedRight = normalizeModelIdentity(right);
+    return normalizedLeft.length > 0 && normalizedLeft === normalizedRight;
+  }
+
   function isEngineReadyForModel(status: EngineStatus | null, modelId: string) {
-    return status?.state === "ready" && status.activeModelId === modelId;
+    return status?.state === "ready" && modelIdsMatch(status.activeModelId, modelId);
   }
 
   function syncPreparedEngineProfile(status: EngineStatus | null = engineStatus) {
@@ -638,6 +656,11 @@
       }
 
       if (status.state === "error" || status.state === "offline" || status.state === "unconfigured") {
+        preparedEngineProfileKey = "";
+        return false;
+      }
+
+      if (status.state === "ready") {
         preparedEngineProfileKey = "";
         return false;
       }
@@ -705,7 +728,9 @@
 
       addSystemMessage(
         "Engine",
-        `${engineStatus?.message ?? "Model is still loading."} Kivarro will use ${profile.name} after the model reaches Ready.`,
+        engineStatus?.state === "ready"
+          ? `${engineStatus.activeModelName ?? "A model"} is ready, but it did not match ${modelName}. Click Restart model to resync the selected model.`
+          : `${engineStatus?.message ?? "Model is still loading."} Kivarro will use ${profile.name} after the model reaches Ready.`,
       );
       return false;
     } catch (error) {
@@ -1733,7 +1758,7 @@
                   }
                 }}
               >
-                <span class:online-dot={engineStatus?.activeModelId === model.id} class="model-status-dot"></span>
+                <span class:online-dot={modelIdsMatch(engineStatus?.activeModelId, model.id)} class="model-status-dot"></span>
                 <span class="model-name-cell">
                   <strong>{model.name}</strong>
                   <small>{model.metadataSource}</small>
@@ -1743,7 +1768,7 @@
                 <code>{formatNumber(model.sizeGib)} GiB</code>
                 <span class:good={model.fit === "Fits"} class:warn={model.fit !== "Fits"}>{model.fit}</span>
                 <button
-                  class:danger={engineStatus?.activeModelId === model.id}
+                  class:danger={modelIdsMatch(engineStatus?.activeModelId, model.id)}
                   class="row-action"
                   disabled={engineBusy}
                   onclick={(event) => {
@@ -1751,7 +1776,7 @@
                     void loadModelFromRegistry(model);
                   }}
                 >
-                  {engineStatus?.activeModelId === model.id ? "Restart" : "Load"}
+                  {modelIdsMatch(engineStatus?.activeModelId, model.id) ? "Restart" : "Load"}
                 </button>
               </div>
             {/each}
