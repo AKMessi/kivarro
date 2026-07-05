@@ -13,7 +13,7 @@
     "test:ui": "playwright test",
     "tauri": "tauri"
   },
-  "license": "MIT",
+  "license": "PolyForm-Noncommercial-1.0.0",
   "dependencies": {
     "@lucide/svelte": "^1.23.0",
     "@tauri-apps/api": "^2",

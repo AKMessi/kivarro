@@ -2,11 +2,13 @@
 
 [![CI](https://github.com/AKMessi/kivarro/actions/workflows/ci.yml/badge.svg)](https://github.com/AKMessi/kivarro/actions/workflows/ci.yml)
 [![Release](https://github.com/AKMessi/kivarro/actions/workflows/release.yml/badge.svg)](https://github.com/AKMessi/kivarro/actions/workflows/release.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/License-PolyForm%20Noncommercial%201.0.0-blue.svg)](LICENSE)
 
 Kivarro is a Rust/Tauri desktop workstation for private local model inference. It gives you one place to register local models, load them through a supervised inference backend, tune runtime profiles, stream chat completions, inspect hardware fit, expose a local OpenAI-compatible API, run benchmarks, test local retrieval, and keep an audit trail of model activity.
 
 It is built for people who want local AI to feel like serious desktop software: dense controls, visible runtime state, inspectable profiles, reproducible settings, and no cloud dependency for inference.
+
+Kivarro is source-available for non-commercial use under the [PolyForm Noncommercial License 1.0.0](LICENSE). This is not an OSI open-source license because commercial use is restricted. For commercial use, contact the repository owner.
 
 ![Kivarro command center](assets/main.png)
 
@@ -441,7 +443,7 @@ Release checklist:
 - GitHub Releases contains Windows x64, Windows ARM64, macOS Intel, macOS Apple Silicon, Linux x64, and Linux ARM64 assets.
 - The release is marked prerelease while Kivarro is still alpha.
 - No local model files, private prompts, imported documents, generated installers, logs, or `.env` files are staged.
-- Package metadata, Cargo metadata, README, and license all agree on `MIT`.
+- Package metadata, Cargo metadata, README, and license all agree on `PolyForm-Noncommercial-1.0.0`.
 
 ## Current Alpha Notes
 
@@ -482,6 +484,6 @@ Security-sensitive reports should follow [SECURITY.md](SECURITY.md).
 
 ## Contributing
 
-Kivarro is open source under the [MIT License](LICENSE).
+Kivarro is source-available for non-commercial use under the [PolyForm Noncommercial License 1.0.0](LICENSE). Commercial use is not granted by this license.
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Keep changes focused, run the verification commands, and do not commit local models or generated release bundles.
