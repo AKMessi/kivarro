@@ -1460,18 +1460,22 @@ fn run_chat_completion_inner(
     let started = SystemTime::now();
     let payload = build_chat_completion_payload(
         &profile,
+        &active_context.backend,
         &active_context.request_model_name,
         prompt,
         &history,
     )?;
-    let response = http_json_request(
+    let response = match http_json_request(
         &active_context.host,
         active_context.port,
         "POST",
         "/v1/chat/completions",
         Some(&payload),
         HTTP_CHAT_TIMEOUT_MS,
-    )?;
+    ) {
+        Ok(response) => response,
+        Err(err) => return Err(refresh_engine_after_request_error(engine, err)),
+    };
     let elapsed_ms = started
         .elapsed()
         .map(|elapsed| elapsed.as_millis())
@@ -1582,6 +1586,7 @@ fn run_chat_completion_stream(
     let started = std::time::Instant::now();
     let mut payload = match build_chat_completion_payload(
         &profile,
+        &active_context.backend,
         &active_context.request_model_name,
         prompt,
         &history,
@@ -1656,6 +1661,11 @@ fn run_chat_completion_stream(
 
     if let Err(err) = stream_result {
         let was_cancelled = cancel_token.load(Ordering::SeqCst);
+        let err = if was_cancelled {
+            err
+        } else {
+            refresh_engine_after_request_error(&engine, err)
+        };
         let phase = if was_cancelled { "cancelled" } else { "error" };
         let emit_result = emit_stream_event(
             &window,
@@ -1663,7 +1673,7 @@ fn run_chat_completion_stream(
                 request_id: request_id.clone(),
                 phase: phase.to_string(),
                 delta: String::new(),
-                content: accumulator.content,
+                content: accumulator.content.clone(),
                 model: active_context.active_model_name.clone(),
                 completion_tokens: accumulator.completion_tokens,
                 tokens_per_second: 0.0,
@@ -3130,6 +3140,9 @@ fn active_engine_context(
         ));
     }
     if guard.child.is_none() {
+        if let Some(error) = guard.last_error.as_ref() {
+            return Err(error.clone());
+        }
         return Err(format!("{process_label} is not running"));
     }
 
@@ -3230,21 +3243,46 @@ fn refresh_engine_process(guard: &mut ManagedEngine) {
         Ok(Some(status)) => {
             guard.child = None;
             guard.load_started_at = None;
-            guard.last_error = Some(format!(
-                "{} exited with status {status}",
-                engine_process_label(&guard.active_backend)
+            guard.last_tokens_per_second = 0.0;
+            guard.context_used_tokens = 0;
+            guard.last_error = Some(engine_exit_message(
+                engine_process_label(&guard.active_backend),
+                &status,
             ));
         }
         Ok(None) => {}
         Err(err) => {
             guard.child = None;
             guard.load_started_at = None;
+            guard.last_tokens_per_second = 0.0;
+            guard.context_used_tokens = 0;
             guard.last_error = Some(format!(
                 "failed to inspect {} process: {err}",
                 engine_process_label(&guard.active_backend)
             ));
         }
     }
+}
+
+fn engine_exit_message(process_label: &str, status: &std::process::ExitStatus) -> String {
+    format!(
+        "{process_label} exited with status {status}. Click Load model to restart. If it repeats, switch to a non-schema profile such as Balanced Engineer or lower context/max tokens."
+    )
+}
+
+fn refresh_engine_after_request_error(engine: &State<'_, EngineRuntime>, err: String) -> String {
+    let Ok(mut guard) = engine.inner.lock() else {
+        return err;
+    };
+
+    refresh_engine_process(&mut guard);
+    if guard.child.is_none() {
+        if let Some(error) = guard.last_error.as_ref() {
+            return error.clone();
+        }
+    }
+
+    err
 }
 
 fn stop_child(guard: &mut ManagedEngine) -> Result<(), String> {
@@ -3558,6 +3596,7 @@ fn probe_engine_health(host: &str, port: u16, timeout_ms: u64) -> HealthProbe {
 
 fn build_chat_completion_payload(
     profile: &InferenceProfile,
+    backend: &str,
     model_name: &str,
     prompt: &str,
     history: &[ChatTurn],
@@ -3622,36 +3661,45 @@ fn build_chat_completion_payload(
         );
     }
 
-    match profile.output.mode.as_str() {
-        "json_schema" if !profile.output.json_schema.trim().is_empty() => {
-            let schema = serde_json::from_str::<Value>(&profile.output.json_schema)
-                .map_err(|err| format!("profile JSON schema is invalid: {err}"))?;
-            payload.insert(
-                "response_format".to_string(),
-                json!({
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "kivarro_profile_schema",
-                        "strict": true,
-                        "schema": schema
-                    }
-                }),
-            );
+    if supports_structured_request_options(backend) {
+        match profile.output.mode.as_str() {
+            "json_schema" if !profile.output.json_schema.trim().is_empty() => {
+                let schema = serde_json::from_str::<Value>(&profile.output.json_schema)
+                    .map_err(|err| format!("profile JSON schema is invalid: {err}"))?;
+                payload.insert(
+                    "response_format".to_string(),
+                    json!({
+                        "type": "json_schema",
+                        "json_schema": {
+                            "name": "kivarro_profile_schema",
+                            "strict": true,
+                            "schema": schema
+                        }
+                    }),
+                );
+            }
+            "json" => {
+                payload.insert(
+                    "response_format".to_string(),
+                    json!({ "type": "json_object" }),
+                );
+            }
+            _ => {}
         }
-        "json" => {
-            payload.insert(
-                "response_format".to_string(),
-                json!({ "type": "json_object" }),
-            );
-        }
-        _ => {}
     }
 
-    if !profile.output.grammar.trim().is_empty() {
+    if supports_structured_request_options(backend) && !profile.output.grammar.trim().is_empty() {
         payload.insert("grammar".to_string(), json!(profile.output.grammar.trim()));
     }
 
     Ok(Value::Object(payload))
+}
+
+fn supports_structured_request_options(backend: &str) -> bool {
+    !matches!(
+        canonical_backend(backend).unwrap_or(BACKEND_LLAMA_CPP),
+        BACKEND_LLAMA_CPP
+    )
 }
 
 fn http_json_request(
@@ -5042,6 +5090,52 @@ mod tests {
         assert_eq!(
             request_model_name(BACKEND_MISTRAL_RS, "Mistral Local"),
             "default"
+        );
+    }
+
+    #[test]
+    fn omits_structured_constraints_for_llama_cpp_payloads() {
+        let mut profile = default_profiles()
+            .into_iter()
+            .find(|profile| profile.id == "strict-json-extractor")
+            .expect("strict JSON profile");
+        profile.output.grammar = "root ::= \"ok\"".to_string();
+
+        let payload =
+            build_chat_completion_payload(&profile, BACKEND_LLAMA_CPP, "local-model", "hello", &[])
+                .expect("llama.cpp chat payload");
+
+        assert!(payload.get("response_format").is_none());
+        assert!(payload.get("grammar").is_none());
+        assert_eq!(
+            payload
+                .pointer("/messages/0/content")
+                .and_then(Value::as_str),
+            Some(profile.system_prompt.as_str())
+        );
+    }
+
+    #[test]
+    fn keeps_structured_constraints_for_non_llama_payloads() {
+        let mut profile = default_profiles()
+            .into_iter()
+            .find(|profile| profile.id == "strict-json-extractor")
+            .expect("strict JSON profile");
+        profile.output.grammar = "root ::= \"ok\"".to_string();
+
+        let payload =
+            build_chat_completion_payload(&profile, BACKEND_MISTRAL_RS, "default", "hello", &[])
+                .expect("mistral.rs chat payload");
+
+        assert_eq!(
+            payload
+                .pointer("/response_format/type")
+                .and_then(Value::as_str),
+            Some("json_schema")
+        );
+        assert_eq!(
+            payload.pointer("/grammar").and_then(Value::as_str),
+            Some("root ::= \"ok\"")
         );
     }
 

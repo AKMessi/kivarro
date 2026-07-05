@@ -761,6 +761,15 @@
       addSystemMessage("Engine", "Select and load a model before sending a prompt.");
       return;
     }
+    if (!engineOnline) {
+      addSystemMessage(
+        "Engine",
+        engineStatus?.state === "error"
+          ? `${engineStatus.message} Click Load model to restart.`
+          : "Load the selected model before sending a prompt.",
+      );
+      return;
+    }
     const requestId = createId("assistant");
 
     const history = chatMessages
@@ -820,6 +829,7 @@
       } else {
         markAssistantError(requestId, message);
       }
+      await refreshRuntime().catch(() => undefined);
     } finally {
       promptBusy = false;
       generationCancelling = false;
